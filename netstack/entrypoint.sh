@@ -50,6 +50,10 @@ fi
 chown -R frr:frr /etc/frr /var/run/frr 2>/dev/null || chown -R root:root /etc/frr /var/run/frr
 
 # --- Kernel + firewall + bridge (re-applied every boot) ---
+# NOTE: NEVER use plain `iptables-restore file` here — it FLUSHES the
+# `DOCKER`, `DOCKER-USER`, etc. chains and breaks any bridged container
+# created afterwards (db/ipam fail with "Unable to enable DNAT rule ...
+# No chain/target/match by that name"). Always append idempotently.
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 if ! ip link show br10 >/dev/null 2>&1; then
     echo "[netstack] creating br10 (${BR10_ADDR})"
@@ -57,10 +61,22 @@ if ! ip link show br10 >/dev/null 2>&1; then
     ip addr add "${BR10_ADDR}" dev br10
 fi
 ip link set br10 up
-if [ -f /templates/iptables-rules.v4 ]; then
-    echo "[netstack] restoring iptables base rules"
-    iptables-restore /templates/iptables-rules.v4 || echo "[netstack] WARNING: iptables-restore had errors"
-fi
+echo "[netstack] applying iptables base rules (append-only, preserves Docker chains)"
+iptables -P INPUT ACCEPT 2>/dev/null || true
+iptables -P FORWARD DROP 2>/dev/null || true
+iptables -P OUTPUT ACCEPT 2>/dev/null || true
+add_rule() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
+# Samba lockdown: allow 445/139 only from trusted local interfaces
+add_rule INPUT -i lo -p tcp -m multiport --dports 445,139 -j ACCEPT
+add_rule INPUT -i br10 -p tcp -m multiport --dports 445,139 -j ACCEPT
+add_rule INPUT -i wg0 -p tcp -m multiport --dports 445,139 -j ACCEPT
+add_rule INPUT -p tcp -m multiport --dports 445,139 -j DROP
+# Lab forwarding: service net <-> WireGuard, WireGuard <-> uplink + hairpin
+add_rule FORWARD -s 192.168.10.0/24 -i br10 -o wg0 -j ACCEPT
+add_rule FORWARD -d 192.168.10.0/24 -i wg0 -o br10 -j ACCEPT
+add_rule FORWARD -i wg0 -o eth0 -j ACCEPT
+add_rule FORWARD -i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+add_rule FORWARD -i wg0 -o wg0 -j ACCEPT
 /usr/local/sbin/ns10-setup.sh || echo "[netstack] WARNING: ns10 setup failed (non-fatal)"
 
 # --- WireGuard interface ---

@@ -1,5 +1,7 @@
-# DARKVEDA LAB — iptables base rules (restored every boot by netstack).
-# No Docker chains here: Docker inserts its own at runtime.
+# DARKVEDA LAB — iptables base rules (reference only, do NOT iptables-restore directly).
+# Plain `iptables-restore` FLUSHES Docker's DOCKER chains and breaks bridged
+# containers (db/ipam DNAT error). netstack/entrypoint.sh applies these same
+# rules append-only via `iptables -C || iptables -A`. Keep the two in sync.
 # NOTE: outbound iface is eth0 below — change it if yours differs (ens3, enp0s3…).
 *filter
 :INPUT ACCEPT [0:0]

@@ -94,6 +94,16 @@ cd DARKVEDALAB
 ./scripts/uninstall.sh --purge-data --rm-images -y   # also delete keys, DB, shares, images
 ```
 
+* Default keeps volumes/images and skips `wg0`/`br10`/`ns10`/iptables cleanup
+  while native host units (`wg-quick@wg0`, `frr`, `smbd`) are active.
+* `--purge-data` deletes WireGuard keys, FRR/Samba state, shares, portal data, DB.
+* `--force-host-net` takes down live `wg0`/`br10`/iptables too (drops VPN/BGP).
+* Never touches the standalone `/root/darkveda-ipam` stack.
+* Verify: `docker ps -a | grep darkveda` is empty; `ip link show br10/wg0`
+  and `iptables -S | grep -E 'br10|wg0|445,139'` are empty unless the native
+  stack owns them.
+
+
 ## License
 
 MIT — share and remix freely. You operate it; secure it.
