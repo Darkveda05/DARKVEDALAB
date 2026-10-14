@@ -1,0 +1,132 @@
+#!/usr/bin/expect -f
+
+set timeout 60
+
+set ip      [lindex $argv 0]
+set user    [lindex $argv 1]
+set pass    [lindex $argv 2]
+set outfile [lindex $argv 3]
+
+log_file -noappend $outfile
+
+spawn ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o KexAlgorithms=+diffie-hellman-group1-sha1 \
+    -o HostKeyAlgorithms=+ssh-rsa \
+    -o Ciphers=aes128-cbc,3des-cbc \
+    $user@$ip
+
+expect {
+
+    "*yes/no*" {
+        send "yes\r"
+        exp_continue
+    }
+
+    "*assword:*" {
+        send "$pass\r"
+    }
+
+    timeout {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+
+    eof {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+}
+
+expect {
+    -re {<.*>} {}
+    timeout {
+        puts "PROMPT NOT FOUND"
+        exit 1
+    }
+}
+
+#
+# Enable hidden command mode
+#
+send "_cmdline-mode on\r"
+
+expect {
+
+    -re {.*Continue.*\[Y/N\].*} {
+        send "Y\r"
+
+        expect {
+            -re {.*password.*} {
+                send "512900\r"
+            }
+            timeout {}
+        }
+    }
+
+    timeout {}
+}
+
+#
+# Disable paging
+#
+send "screen-length disable\r"
+
+expect {
+    -re {\[.*\]} {}
+    timeout {}
+}
+
+
+#
+# Enter system view
+#
+send "system-view\r"
+
+expect {
+    -re {\[.*\]} {}
+    timeout {
+        puts "SYSTEM VIEW FAILED"
+        exit 1
+    }
+}
+
+
+#
+# Collect config
+#
+puts "RUN: display current-configuration"
+
+send "display current-configuration\r"
+
+expect {
+
+    -re {---- More ----} {
+        send " "
+        exp_continue
+    }
+
+    -re {\[.*\]} {
+    }
+
+    timeout {
+    }
+}
+
+#
+# Exit system-view
+#
+send "quit\r"
+
+expect {
+    -re {<.*>} {}
+    timeout {}
+}
+
+#
+# Logout
+#
+send "quit\r"
+
+expect eof

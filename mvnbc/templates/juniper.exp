@@ -1,0 +1,73 @@
+#!/usr/bin/expect -f
+
+set timeout 60
+
+set ip       [lindex $argv 0]
+set username [lindex $argv 1]
+set password [lindex $argv 2]
+set outfile  [lindex $argv 3]
+
+log_file -noappend $outfile
+
+spawn ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    $username@$ip
+
+expect {
+    "(yes/no)" {
+        send "yes\r"
+        exp_continue
+    }
+
+    "*assword:*" {
+        send "$password\r"
+    }
+
+    timeout {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+
+    eof {
+        exit 1
+    }
+}
+
+expect {
+    ">" {}
+    "#" {}
+    timeout {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+}
+
+# Disable paging
+send "set cli screen-length 0\r"
+
+expect {
+    "Screen length set to 0" {}
+    ">" {}
+    "#" {}
+    timeout {}
+}
+
+# Dump full config
+send "show configuration | no-more | display set\r"
+
+# Wait longer for all output to finish
+set timeout 180
+sleep 3
+
+expect {
+    -re {.*>} {}
+    -re {.*#} {}
+    timeout {}
+}
+
+# Stop logging before exit
+log_file
+
+send "exit\r"
+expect eof

@@ -1,0 +1,21 @@
+#!/bin/bash
+# DARKVEDA LAB systemd-run compatibility shim (docker builds only).
+# Supports the portal's self-restart pattern:
+#   systemd-run --quiet --on-active=N /bin/systemctl restart <unit>
+# Runs the mapped command detached after N seconds and answers at once.
+# NOT for host use.
+delay=0
+cmd=()
+for a in "$@"; do
+    case "$a" in
+        --on-active=*) delay="${a#*=}" ;;
+        --quiet|--collect|--no-block) ;;
+        --*) ;;
+        *) cmd+=("$a") ;;
+    esac
+done
+[ "${#cmd[@]}" -eq 0 ] && { echo "nothing to run" >&2; exit 1; }
+case "${cmd[0]}" in /bin/systemctl|systemctl) cmd[0]="systemctl" ;; esac
+( setsid sleep "$delay" >/dev/null 2>&1; setsid "${cmd[@]}" >/dev/null 2>&1 & ) 2>/dev/null
+echo "Scheduled."
+exit 0

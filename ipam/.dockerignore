@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------
+# Keep the build context lean and secrets out of the image.
+# The container reads all configuration from environment variables
+# (see config/config.example.php), so no local config or .env is
+# ever needed — or wanted — inside the image.
+# ---------------------------------------------------------------
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Secrets and local config (never bake these in)
+.env
+*.env
+!.env.example
+config/config.php
+
+# Runtime data — provided by a mounted volume at run time
+public/uploads/*
+!public/uploads/.gitkeep
+!public/uploads/.htaccess
+!public/uploads/README.txt
+
+# Backups & dumps
+*.sql.gz
+*.tar.gz
+backup-*.sql
+darkveda-ipam-*.zip
+
+# Dependencies (if ever added)
+vendor/
+node_modules/
+
+# Editors / OS cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Docs that don't belong in a runtime image
+*.md
+!README.md

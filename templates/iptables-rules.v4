@@ -1,0 +1,30 @@
+# DARKVEDA LAB — iptables base rules (restored every boot by netstack).
+# No Docker chains here: Docker inserts its own at runtime.
+# NOTE: outbound iface is eth0 below — change it if yours differs (ens3, enp0s3…).
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+# Samba lockdown: allow 445/139 only from trusted local interfaces
+-A INPUT -i lo -p tcp -m multiport --dports 445,139 -j ACCEPT
+-A INPUT -i br10 -p tcp -m multiport --dports 445,139 -j ACCEPT
+-A INPUT -i wg0 -p tcp -m multiport --dports 445,139 -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 445,139 -j DROP
+# Lab forwarding: service net <-> WireGuard, WireGuard <-> uplink + hairpin
+-A FORWARD -s 192.168.10.0/24 -i br10 -o wg0 -j ACCEPT
+-A FORWARD -d 192.168.10.0/24 -i wg0 -o br10 -j ACCEPT
+-A FORWARD -i wg0 -o eth0 -j ACCEPT
+-A FORWARD -i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i wg0 -o wg0 -j ACCEPT
+COMMIT
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# Examples (uncomment as needed):
+# Road-warrior client via WireGuard (replace .3 with the client /32):
+#-A POSTROUTING -s 10.99.0.3/32 -o eth0 -j MASQUERADE
+#-A POSTROUTING -s 10.99.0.3/32 -d 172.16.0.0/24 -o wg0 -j MASQUERADE
+#-A POSTROUTING -s 10.99.0.3/32 -d 192.168.10.0/24 -o wg0 -j MASQUERADE
+COMMIT

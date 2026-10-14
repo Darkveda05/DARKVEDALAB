@@ -1,0 +1,11 @@
+# DARKVEDA LAB — WireGuard server (rendered on first boot; managed via portal after)
+[Interface]
+Address = ${WG_ADDR}
+ListenPort = ${WG_PORT}
+PrivateKey = ${WG_PRIVATE_KEY}
+
+# Peers are added from the portal (WireGuard Peers card), which also
+# generates client configs + QR codes. Example afterwards:
+# [Peer]
+# PublicKey = <HOME-ROUTER-PUBKEY>
+# AllowedIPs = 10.99.0.2/32, 172.16.0.0/24, 172.16.10.0/24, 172.16.20.0/24, 172.16.30.0/24, 172.16.100.0/24

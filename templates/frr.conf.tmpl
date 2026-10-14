@@ -1,0 +1,29 @@
+! DARKVEDA LAB — FRR/BGP (rendered on first boot; HOME_IN_RULES/VPS_OUT_RULE
+! are generated from HOME_NETS/ORIGIN_NET env vars — see netstack entrypoint)
+frr defaults traditional
+hostname darkveda-lab
+log syslog informational
+service integrated-vtysh-config
+!
+${HOME_IN_RULES}
+${VPS_OUT_RULES}
+!
+route-map HOME-IN permit 10
+ match ip address prefix-list HOME-IN
+exit
+!
+route-map VPS-OUT permit 10
+ match ip address prefix-list VPS-OUT
+exit
+!
+router bgp ${BGP_AS}
+ bgp router-id ${BGP_ROUTER_ID}
+ neighbor ${BGP_PEER} remote-as ${BGP_PEER_AS}
+ !
+ address-family ipv4 unicast
+  network ${ORIGIN_NET}
+  neighbor ${BGP_PEER} route-map HOME-IN in
+  neighbor ${BGP_PEER} route-map VPS-OUT out
+ exit-address-family
+exit
+!

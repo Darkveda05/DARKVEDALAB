@@ -1,0 +1,6 @@
+# MVNBC devices — EXAMPLE (dummy values for reference only)
+# Format: vendor,ip,username,password[,enable_password]
+# Copy to devices.conf and fill in YOUR devices. NEVER commit real credentials.
+mikrotik,192.0.2.1,admin,CHANGEME
+h3c_1920,192.0.2.2,admin,CHANGEME
+cisco,192.0.2.3,admin,CHANGEME

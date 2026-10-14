@@ -1,0 +1,60 @@
+#!/usr/bin/expect -f
+
+set timeout 40
+
+set ip   [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+
+spawn ssh -o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+$user@$ip
+
+# Login
+expect {
+    "*yes/no*" { send "yes\r"; exp_continue }
+    "*assword:*" { send "$pass\r" }
+    timeout { puts "LOGIN TIMEOUT"; exit 0 }
+}
+
+# Detect prompt safely
+expect {
+    -re {.*[#>)]} {}
+    timeout { puts "NO PROMPT"; exit 0 }
+}
+
+# Disable paging (correct ArubaCX)
+send "no page\r"
+expect -re {.*[#>)]}
+
+# Commands (VALID ArubaCX)
+set commands {
+    "show run"
+}
+
+foreach cmd $commands {
+
+    puts "\nRUN: $cmd"
+
+    send "$cmd\r"
+
+    expect {
+        -re {--More--} {
+            send " "
+            exp_continue
+        }
+
+        -re {.*[#>)]} {
+            # success
+        }
+
+        timeout {
+            puts "SKIP TIMEOUT: $cmd"
+        }
+    }
+}
+
+send "exit\r"
+expect eof
+
+exit 0

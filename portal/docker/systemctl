@@ -1,0 +1,67 @@
+#!/bin/bash
+# DARKVEDA LAB systemctl compatibility shim (docker builds only).
+# The portal was written against host systemd. Inside the container the same
+# unit names map to local equivalents. Unknown units fall through to the real
+# systemctl (which reports "not booted" as usual). NOT for host use.
+REAL=/bin/systemctl
+SUPER_REMOTE="http://127.0.0.1:9001"
+
+cmd="${1:-}"; unit="${2:-}"
+
+sup_state() { # $1 = @remote for netstack supervisor, rest = program names; active only if ALL RUNNING
+    local out progs n
+    if [ "$1" == "@remote" ]; then shift
+        out=$(supervisorctl -s "$SUPER_REMOTE" status "$@" 2>/dev/null) || { echo unknown; return; }
+    else
+        out=$(supervisorctl status "$@" 2>/dev/null) || { echo unknown; return; }
+    fi
+    progs=$#; n=$(echo "$out" | grep -c "RUNNING")
+    if [ "$n" -ge "$progs" ] && [ "$progs" -gt 0 ]; then echo active; else echo inactive; fi
+}
+
+case "$cmd" in
+    restart)
+        case "$unit" in
+            wg-quick@*) iface="${unit#wg-quick@}"; wg-quick down "$iface" && wg-quick up "$iface" ;;
+            frr) supervisorctl -s "$SUPER_REMOTE" restart zebra bgpd staticd ;;
+            smbd) supervisorctl restart smbd ;;
+            ns10.service) /usr/local/sbin/ns10-setup.sh ;;
+            netfilter-persistent)
+                iptables-restore /etc/iptables/rules.v4
+                [ -f /etc/iptables/rules.v6 ] && ip6tables-restore /etc/iptables/rules.v6
+                ;;
+            darkveda-lab|wg-monitor) supervisorctl restart portal ;;
+            *) exec "$REAL" "$@" ;;
+        esac
+        ;;
+    is-active)
+        case "$unit" in
+            wg-quick@*) ip link show "${unit#wg-quick@}" >/dev/null 2>&1 && echo active || echo inactive ;;
+            frr)
+                [ "$(sup_state @remote zebra bgpd staticd)" == "active" ] && echo active || echo inactive ;;
+            smbd) sup_state smbd ;;
+            ns10.service) ip link show veth10-host >/dev/null 2>&1 && echo active || echo inactive ;;
+            netfilter-persistent|networking) ip route show default | grep -q . && echo active || echo inactive ;;
+            darkveda-lab|wg-monitor) sup_state portal ;;
+            *) exec "$REAL" "$@" ;;
+        esac
+        ;;
+    is-enabled)
+        case "$unit" in
+            wg-quick@*|frr|smbd|ns10.service|netfilter-persistent|networking|darkveda-lab|wg-monitor)
+                echo enabled ;;
+            *) exec "$REAL" "$@" ;;
+        esac
+        ;;
+    enable|disable)
+        case "$unit" in
+            wg-quick@*|frr|smbd|ns10.service|netfilter-persistent|networking|darkveda-lab|wg-monitor)
+                echo "autostart is static in docker mode (supervisord); $cmd ignored for $unit" >&2; exit 1 ;;
+            *) exec "$REAL" "$@" ;;
+        esac
+        ;;
+    daemon-reload)
+        exit 0 ;;
+    *)
+        exec "$REAL" "$@" ;;
+esac

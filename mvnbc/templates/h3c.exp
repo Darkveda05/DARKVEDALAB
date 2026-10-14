@@ -1,0 +1,67 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+
+set ip   [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+
+spawn ssh -o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+-o KexAlgorithms=+diffie-hellman-group1-sha1 \
+-o HostKeyAlgorithms=+ssh-rsa \
+-o Ciphers=aes128-cbc,3des-cbc \
+$user@$ip
+
+# Login
+expect {
+    "*yes/no*" { send "yes\r"; exp_continue }
+    "*assword:*" { send "$pass\r" }
+    timeout { puts "LOGIN TIMEOUT"; exit 0 }
+}
+
+# Detect prompt safely
+expect {
+    ">" {}
+    "]" {}
+    "<*" {}
+    timeout { puts "NO PROMPT"; exit 0 }
+}
+
+# Disable paging (safe ignore if fails)
+send "screen-length disable\r"
+expect -re {.*(>|]).*}
+
+# List of commands (safe mode)
+set commands {
+    "system-view"
+    "display cu"
+}
+
+foreach cmd $commands {
+
+    puts "\nRUN: $cmd"
+
+    send "$cmd\r"
+
+    # IMPORTANT: we NEVER fail
+    expect {
+        -re {.*--More--.*} {
+            send " "
+            exp_continue
+        }
+
+        -re {.*(>|]).*} {
+            # normal success return to prompt
+        }
+
+        timeout {
+            puts "SKIP (timeout): $cmd"
+        }
+    }
+}
+
+send "quit\r"
+expect eof
+
+exit 0

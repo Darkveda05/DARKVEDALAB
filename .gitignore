@@ -1,0 +1,73 @@
+# =============================================================
+# DARKVEDA LAB — never commit secrets, credentials, or live state.
+# Only *.example templates with dummy values belong in git.
+# =============================================================
+
+# --- Environment & secrets ---
+.env
+*.env
+!.env.example
+*.key
+*private*
+*secret*
+password.txt
+bot_admins.json
+.bot_offset
+
+# --- WireGuard live state (keys are generated at first boot) ---
+portal/wg0.conf
+portal/*.conf
+*.conf.bak*
+*.tmp
+
+# --- Portal runtime state ---
+portal/users.json
+portal/secret.key
+portal/traffic.db
+portal/portal_tabs.json
+portal/peers/*
+!portal/peers/.gitkeep
+portal/backups/*
+!portal/backups/.gitkeep
+portal/bot_inbox/*
+!portal/bot_inbox/.gitkeep
+portal/__pycache__/
+portal/*.log
+
+# --- Python / editors / OS ---
+__pycache__/
+*.py[cod]
+venv/
+node_modules/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Samba live state ---
+smbpasswd.tdb
+secrets.tdb
+*.tdb
+
+# --- MVNBC live data (real device credentials/configs!) ---
+mvnbc/config/devices.conf
+mvnbc/config/settings.json
+mvnbc/backups/*
+!mvnbc/backups/.gitkeep
+mvnbc/logs/*
+!mvnbc/logs/.gitkeep
+
+# --- IPAM live data ---
+ipam/public/uploads/*
+!ipam/public/uploads/.gitkeep
+!ipam/public/uploads/.htaccess
+!ipam/public/uploads/README.txt
+*.sql.gz
+*.tar.gz
+backup-*.sql
+
+# --- Local backups & dumps ---
+*.bak.*
+*.log

@@ -1,0 +1,26 @@
+{
+  "alerts": {
+    "notify_on": "failure"
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_secure": "tls",
+    "username": "",
+    "password": "CHANGEME",
+    "from": "",
+    "to": ""
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "CHANGEME",
+    "chat_id": ""
+  },
+  "retention": {
+    "keep_backups": 50,
+    "keep_logs": 30,
+    "auto_prune_30d": false,
+    "max_age_days": 30
+  }
+}

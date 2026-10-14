@@ -1,0 +1,129 @@
+# =============================================================
+# DARKVEDA LAB — one command brings up the whole lab
+#   cp .env.example .env   # review it first (passwords!)
+#   docker compose up -d --build
+#
+# netstack + portal run with host networking + privileges because they
+# manage the HOST netns (WireGuard, iptables, bridges) like a native
+# install. ipam/db are ordinary bridged containers.
+# =============================================================
+
+services:
+  netstack:
+    build:
+      context: .
+      dockerfile: netstack/Dockerfile
+    image: darkveda-netstack:local
+    container_name: darkveda-netstack
+    network_mode: host
+    privileged: true
+    volumes:
+      - wgconf:/etc/wireguard
+      - frrconf:/etc/frr
+      - frrrun:/var/run/frr
+    environment:
+      WG_ADDR: ${WG_ADDR:-10.99.0.1/24}
+      WG_PORT: ${WG_PORT:-51820}
+      BR10_ADDR: ${BR10_ADDR:-192.168.10.1/24}
+      BGP_AS: ${BGP_AS:-65001}
+      BGP_PEER: ${BGP_PEER:-10.99.0.2}
+      BGP_PEER_AS: ${BGP_PEER_AS:-65002}
+      BGP_ROUTER_ID: ${BGP_ROUTER_ID:-10.99.0.1}
+      ORIGIN_NET: ${ORIGIN_NET:-192.168.10.0/24}
+      HOME_NETS: ${HOME_NETS:-172.16.0.0/24,172.16.10.0/24,172.16.20.0/24,172.16.30.0/24,172.16.100.0/24}
+    restart: unless-stopped
+
+  portal:
+    build:
+      context: .
+      dockerfile: portal/Dockerfile
+    image: darkveda-portal:local
+    container_name: darkveda-portal
+    network_mode: host
+    privileged: true
+    depends_on:
+      - netstack
+    volumes:
+      - wgconf:/etc/wireguard
+      - frrconf:/etc/frr
+      - frrrun:/var/run/frr
+      - smbconf:/etc/samba
+      - sambadb:/var/lib/samba
+      - shares:/DATA
+      - portaldata:/opt/portal/data
+      - peers:/opt/portal/peers
+      - backups:/opt/portal/backups
+      - bot_inbox:/opt/portal/bot_inbox
+      - mvnbcdata:/opt/mvnbc
+    environment:
+      CTL_MODE: supervisor
+      TZ: ${APP_TZ:-UTC}
+      MVNBC_DIR: /opt/mvnbc
+      IPAM_ENV_FILE: /opt/ipam.env
+      IPAM_DB_HOST: 127.0.0.1
+      DB_NAME: ${DB_NAME:-darkveda_ipam}
+      DB_USER: ${DB_USER:-darkveda}
+      DB_PASS: ${DB_PASS:?set DB_PASS in .env}
+    restart: unless-stopped
+
+  ipam:
+    build:
+      context: ./ipam
+      dockerfile: docker/Dockerfile
+    image: darkveda-ipam:local
+    container_name: darkveda-ipam
+    ports:
+      - "${APP_PORT:-8091}:80"
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-darkveda_ipam}
+      DB_USER: ${DB_USER:-darkveda}
+      DB_PASS: ${DB_PASS:?set DB_PASS in .env}
+      APP_TZ: ${APP_TZ:-UTC}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-adminadmin}
+      ZABBIX_URL: ${ZABBIX_URL:-}
+      ZABBIX_TOKEN: ${ZABBIX_TOKEN:-}
+      ZABBIX_VERIFY_TLS: ${ZABBIX_VERIFY_TLS:-true}
+    volumes:
+      - ipuploads:/var/www/html/public/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: mariadb:11
+    container_name: darkveda-ipam-db
+    restart: unless-stopped
+    # Loopback-only publish so the host-networked portal can reach the DB.
+    ports:
+      - "127.0.0.1:3306:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:?set DB_ROOT_PASS in .env}
+      MARIADB_DATABASE: ${DB_NAME:-darkveda_ipam}
+      MARIADB_USER: ${DB_USER:-darkveda}
+      MARIADB_PASSWORD: ${DB_PASS:?set DB_PASS in .env}
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  wgconf:
+  frrconf:
+  frrrun:
+  smbconf:
+  sambadb:
+  shares:
+  portaldata:
+  peers:
+  backups:
+  bot_inbox:
+  mvnbcdata:
+  dbdata:
+  ipuploads:

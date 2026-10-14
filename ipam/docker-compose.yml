@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------
+# DarkVeda IPAM — quick start
+#
+#   cp .env.example .env      # then edit the passwords
+#   docker compose up -d
+#   open http://localhost:8080   (admin / ADMIN_PASSWORD from .env)
+# ---------------------------------------------------------------
+services:
+  app:
+
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: darkveda-ipam:local
+    container_name: darkveda-ipam
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-darkveda_ipam}
+      DB_USER: ${DB_USER:-darkveda}
+      DB_PASS: ${DB_PASS:?set DB_PASS in .env}
+      APP_TZ: ${APP_TZ:-UTC}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ZABBIX_URL: ${ZABBIX_URL:-}
+      ZABBIX_TOKEN: ${ZABBIX_TOKEN:-}
+      ZABBIX_VERIFY_TLS: ${ZABBIX_VERIFY_TLS:-true}
+    volumes:
+      - uploads:/var/www/html/public/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mariadb:11
+    container_name: darkveda-ipam-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:?set DB_ROOT_PASS in .env}
+      MARIADB_DATABASE: ${DB_NAME:-darkveda_ipam}
+      MARIADB_USER: ${DB_USER:-darkveda}
+      MARIADB_PASSWORD: ${DB_PASS:?set DB_PASS in .env}
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  dbdata:
+  uploads:

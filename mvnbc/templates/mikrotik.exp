@@ -1,0 +1,90 @@
+#!/usr/bin/expect -f
+
+set IP      [lindex $argv 0]
+set USER    [lindex $argv 1]
+set PASS    [lindex $argv 2]
+set OUTFILE [lindex $argv 3]
+
+set timeout 180
+
+# Write session output to backup file
+log_file -noappend $OUTFILE
+
+spawn ssh -o StrictHostKeyChecking=no $USER@$IP
+
+# Login
+expect {
+    "*yes/no*" {
+        send "yes\r"
+        exp_continue
+    }
+
+    "*assword:*" {
+        send "$PASS\r"
+    }
+
+    timeout {
+        puts "SSH CONNECTION TIMEOUT"
+        exit 1
+    }
+
+    eof {
+        puts "SSH CONNECTION FAILED"
+        exit 1
+    }
+}
+
+# Wait for RouterOS prompt
+expect {
+    -re {\[.*@.*\][[:space:]]*[>#]} {}
+
+    "*Login failed*" {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+
+    "*incorrect*" {
+        puts "LOGIN FAILED"
+        exit 1
+    }
+
+    timeout {
+        puts "LOGIN TIMEOUT"
+        exit 1
+    }
+}
+
+# Sync prompt
+send "\r"
+
+expect {
+    -re {\[.*@.*\][[:space:]]*[>#]} {}
+
+    timeout {
+        puts "PROMPT SYNC TIMEOUT"
+        exit 1
+    }
+}
+
+
+# Export configuration
+send "/export show-sensitive terse\r"
+
+expect {
+    -re {\[.*@.*\][[:space:]]*[>#]} {}
+
+    timeout {
+        puts "EXPORT TIMEOUT"
+        exit 1
+    }
+}
+
+# Stop logging BEFORE quitting
+log_file
+
+# Small delay to flush output
+after 500
+
+send "/quit\r"
+
+expect eof

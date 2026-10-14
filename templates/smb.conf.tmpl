@@ -1,0 +1,29 @@
+# DARKVEDA LAB — Samba (rendered/copied on first boot; managed via portal after)
+# Demo share [lab] for user admin. Per-user write control via `write list`;
+# daemons access files as the connecting user, enforced by filesystem ACLs.
+[global]
+   workgroup = WORKGROUP
+   server string = DARKVEDA LAB file server
+   server role = standalone server
+   disable netbios = yes
+   obey pam restrictions = yes
+   unix password sync = yes
+   passwd program = /usr/bin/passwd %u
+   passwd chat = *Enter\snew\s*\spassword:* %n\n *Retype\snew\s*\spassword:* %n\n *password\supdated\ssuccessfully* .
+   pam password change = yes
+   map to guest = bad user
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   logging = file
+   panic action = /usr/share/samba/panic-action %d
+
+[lab]
+   path = /DATA/labshare
+   comment = DARKVEDA LAB share
+   browseable = yes
+   read only = yes
+   valid users = admin
+   write list = admin
+   hosts deny = 0.0.0.0/0
+   create mask = 0664
+   directory mask = 0775

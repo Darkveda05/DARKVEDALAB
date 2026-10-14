@@ -1,0 +1,85 @@
+#!/usr/bin/expect -f
+
+set timeout 40
+
+# ==================================================
+# ARGUMENTS
+# ==================================================
+set ip      [lindex $argv 0]
+set user    [lindex $argv 1]
+set pass    [lindex $argv 2]
+set enable  [lindex $argv 3]
+set backup  [lindex $argv 4]
+
+# ==================================================
+# SAVE OUTPUT TO FILE
+# ==================================================
+log_file -noappend $backup
+
+# ==================================================
+# SSH CONNECTION
+# ==================================================
+spawn ssh \
+-o StrictHostKeyChecking=no \
+-o KexAlgorithms=+diffie-hellman-group1-sha1 \
+-o HostKeyAlgorithms=+ssh-rsa \
+-o Ciphers=aes256-ctr,aes192-ctr,aes128-ctr \
+$user@$ip
+
+expect {
+    "*yes/no*" {
+        send "yes\r"
+        exp_continue
+    }
+    "*assword:" {
+        send "$pass\r"
+    }
+    timeout {
+        exit 1
+    }
+}
+
+# ==================================================
+# DETECT PROMPT
+# ==================================================
+expect {
+    ">" {}
+    "#" {}
+    timeout { exit 1 }
+}
+
+# ==================================================
+# ENABLE MODE (SAFE)
+# ==================================================
+send "enable\r"
+
+expect {
+    "*assword:" {
+        send "$enable\r"
+        exp_continue
+    }
+    "#" {}
+    timeout { exit 1 }
+}
+
+# ==================================================
+# DISABLE PAGING
+# ==================================================
+send "terminal length 0\r"
+expect "#"
+
+# ==================================================
+# GET CONFIG
+# ==================================================
+send "show running-config\r"
+
+expect {
+    "#" {}
+    timeout { exit 1 }
+}
+
+# ==================================================
+# EXIT
+# ==================================================
+send "exit\r"
+expect eof
