@@ -28,7 +28,8 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER && newgrp docker
 
 # *(host)* Fetch the lab
-git clone https://github.com/<your-username>/DarkvedaLab.git && cd DarkvedaLab
+git clone https://github.com/Darkveda05/DARKVEDALAB.git
+cd DARKVEDALAB
 cp .env.example .env
 nano .env            # <-- set passwords, subnets, public IP
 docker compose up -d --build
