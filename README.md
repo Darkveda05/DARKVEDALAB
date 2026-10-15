@@ -130,6 +130,7 @@ backups) is in **[INSTALL.md](INSTALL.md)**.
 
 ```bash
 cd DARKVEDALAB
+chmod +x scripts/uninstall.sh
 ./scripts/uninstall.sh --help
 ./scripts/uninstall.sh                        # containers + networks, prompts first
 ./scripts/uninstall.sh --purge-data --rm-images -y   # also delete keys, DB, shares, images
