@@ -1,5 +1,11 @@
 # MVNBC devices — EXAMPLE (dummy values for reference only)
-# Format: vendor,ip,username,password[,enable_password]
+# Format: vendor,ip,username,password[,enable_password[,ssh_port]]
+# STANDALONE / LOCAL LAN mode: no Docker, no WireGuard, no portal needed.
+# Just put the router's LAN IP here and run ./MVNBC.sh --auto from mvnbc/.
+#   mikrotik,192.168.88.1,admin,CHANGEME
+# Custom SSH port (inline or 6th field — both work):
+#   mikrotik,192.168.88.1:2222,admin,CHANGEME
+#   mikrotik,192.168.88.1,admin,CHANGEME,,2222
 # Copy to devices.conf and fill in YOUR devices. NEVER commit real credentials.
 mikrotik,192.0.2.1,admin,CHANGEME
 h3c_1920,192.0.2.2,admin,CHANGEME

@@ -1,6 +1,7 @@
 # DARKVEDA LAB — Samba (rendered/copied on first boot; managed via portal after)
-# Demo share [lab] for user admin. Per-user write control via `write list`;
-# daemons access files as the connecting user, enforced by filesystem ACLs.
+# Default share [sharelab] for user admin (read & write). Per-user write
+# control via `write list`; daemons access files as the connecting user,
+# enforced by filesystem ACLs. Folder: ./sharelab on host (/DATA/sharelab).
 [global]
    workgroup = WORKGROUP
    server string = DARKVEDA LAB file server
@@ -17,13 +18,13 @@
    logging = file
    panic action = /usr/share/samba/panic-action %d
 
-[lab]
-   path = /DATA/labshare
-   comment = DARKVEDA LAB share
+# Open access: reachable from any IP (auth still via valid users).
+[sharelab]
+   path = /DATA/sharelab
+   comment = DARKVEDA LAB default share
    browseable = yes
    read only = yes
    valid users = admin
    write list = admin
-   hosts deny = 0.0.0.0/0
    create mask = 0664
    directory mask = 0775

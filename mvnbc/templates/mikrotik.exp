@@ -4,13 +4,28 @@ set IP      [lindex $argv 0]
 set USER    [lindex $argv 1]
 set PASS    [lindex $argv 2]
 set OUTFILE [lindex $argv 3]
+set PORT    [lindex $argv 4]
+set CONNTIMEOUT [lindex $argv 5]
+
+if {$PORT eq ""} { set PORT 22 }
+if {$CONNTIMEOUT eq ""} { set CONNTIMEOUT 15 }
 
 set timeout 180
 
 # Write session output to backup file
 log_file -noappend $OUTFILE
 
-spawn ssh -o StrictHostKeyChecking=no $USER@$IP
+# Dumb terminal: stops RouterOS 7 probing the terminal for capabilities
+# (ESC[9999B / ESC[6n sequences) and keeps output plain for log_file.
+set env(TERM) "dumb"
+
+# Direct SSH to LAN IP — no WireGuard/tunnel required.
+# ConnectTimeout keeps LAN failures fast instead of hanging.
+spawn ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$CONNTIMEOUT -p $PORT $USER@$IP
+
+# Wide pty so long `/export terse` lines are not wrapped mid-word by the
+# terminal layer (which would corrupt single-line commands). Best effort.
+catch {stty cols 300 rows 60 < $spawn_out(slave,name)}
 
 # Login
 expect {
@@ -67,10 +82,22 @@ expect {
 }
 
 
-# Export configuration
+# Export configuration (show-sensitive on ROSv7, fallback to plain terse on old ROS)
 send "/export show-sensitive terse\r"
 
 expect {
+    -re {expected end of command|bad command name|no such command} {
+        send "/export terse\r"
+        expect {
+            -re {\[.*@.*\][[:space:]]*[>#]} {}
+
+            timeout {
+                puts "EXPORT TIMEOUT"
+                exit 1
+            }
+        }
+    }
+
     -re {\[.*@.*\][[:space:]]*[>#]} {}
 
     timeout {

@@ -519,10 +519,12 @@ INSERT INTO role_permissions (role_id, permission_id)
 INSERT INTO role_permissions (role_id, permission_id)
   SELECT 3, id FROM permissions WHERE name IN ('dashboard.view','ipam.view','devices.view','discovery.view','topology.view','racks.view','monitoring.view','docs.view');
 
--- Default admin — username: admin / password: DarkVeda@123  (CHANGE THIS)
+-- Default admin — username: admin / password: adminadmin (demo default, CHANGE THIS).
+-- The docker entrypoint also forces this from ADMIN_PASSWORD in .env,
+-- so a normal `docker compose up` always lands on admin / adminadmin.
 INSERT INTO users (username, email, password_hash, full_name, role_id) VALUES
   ('admin', 'admin@darkveda.local',
-   '$2y$10$PLACEHOLDER_HASH_REPLACED_BY_INSTALLER',
+   '$2b$12$tJ6nL6MLoj5ktwJlIn8zn.EQYHHZPf6rKtju06R5E4QwTuQz4EuG.',
    'DarkVeda Administrator', 1);
 
 INSERT INTO sites (name, slug, address, description) VALUES

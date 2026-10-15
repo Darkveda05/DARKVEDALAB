@@ -1,19 +1,13 @@
 #!/bin/bash
-# DARKVEDA LAB netstack entrypoint: first-boot setup (idempotent), then FRR.
+# DARKVEDA LAB netstack entrypoint: first-boot setup (idempotent).
 # Requires: privileged + host networking (manages the host netns).
 set -e
 
 WG_ADDR="${WG_ADDR:-10.99.0.1/24}"
 WG_PORT="${WG_PORT:-51820}"
 BR10_ADDR="${BR10_ADDR:-192.168.10.1/24}"
-BGP_AS="${BGP_AS:-65001}"
-BGP_PEER="${BGP_PEER:-10.99.0.2}"
-BGP_PEER_AS="${BGP_PEER_AS:-65002}"
-BGP_ROUTER_ID="${BGP_ROUTER_ID:-10.99.0.1}"
-ORIGIN_NET="${ORIGIN_NET:-192.168.10.0/24}"
-HOME_NETS="${HOME_NETS:-172.16.0.0/24,172.16.10.0/24,172.16.20.0/24,172.16.30.0/24,172.16.100.0/24}"
 
-mkdir -p /etc/wireguard /etc/frr /var/run/frr /var/log/supervisor
+mkdir -p /etc/wireguard /var/log/supervisor
 
 # --- WireGuard server keys (persisted in wgconf volume) ---
 if [ ! -f /etc/wireguard/server_private.key ]; then
@@ -25,35 +19,21 @@ fi
 export WG_PRIVATE_KEY="$(cat /etc/wireguard/server_private.key)"
 export WG_ADDR WG_PORT
 
-# --- Prefix-lists from env (comma-separated CIDRs) ---
-HOME_IN_RULES=""
-i=10
-for net in $(echo "$HOME_NETS" | tr ',' ' '); do
-    HOME_IN_RULES="${HOME_IN_RULES}ip prefix-list HOME-IN seq $i permit $net
-"
-    i=$((i + 1))
-done
-VPS_OUT_RULES="ip prefix-list VPS-OUT seq 10 permit ${ORIGIN_NET}"
-export HOME_IN_RULES VPS_OUT_RULES
-
-# --- Render configs only if missing (never clobber portal edits) ---
+# --- Render wg0.conf only if missing (never clobber portal edits) ---
 if [ ! -f /etc/wireguard/wg0.conf ]; then
     echo "[netstack] rendering wg0.conf (no peers yet — add them in the portal)"
     envsubst < /templates/wg0.conf.tmpl > /etc/wireguard/wg0.conf
     chmod 600 /etc/wireguard/wg0.conf
 fi
-if [ ! -f /etc/frr/frr.conf ]; then
-    echo "[netstack] rendering frr.conf"
-    export BGP_AS BGP_PEER BGP_PEER_AS BGP_ROUTER_ID ORIGIN_NET HOME_NETS
-    envsubst < /templates/frr.conf.tmpl > /etc/frr/frr.conf
-fi
-chown -R frr:frr /etc/frr /var/run/frr 2>/dev/null || chown -R root:root /etc/frr /var/run/frr
 
 # --- Kernel + firewall + bridge (re-applied every boot) ---
 # NOTE: NEVER use plain `iptables-restore file` here — it FLUSHES the
 # `DOCKER`, `DOCKER-USER`, etc. chains and breaks any bridged container
 # created afterwards (db/ipam fail with "Unable to enable DNAT rule ...
 # No chain/target/match by that name"). Always append idempotently.
+# Firewall is OPEN by design (user request: no blocking): INPUT/FORWARD/
+# OUTPUT policies are ACCEPT and no DROP/REJECT rules are installed for
+# Samba or forwarding. Docker's own chains are left untouched.
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 if ! ip link show br10 >/dev/null 2>&1; then
     echo "[netstack] creating br10 (${BR10_ADDR})"
@@ -61,23 +41,30 @@ if ! ip link show br10 >/dev/null 2>&1; then
     ip addr add "${BR10_ADDR}" dev br10
 fi
 ip link set br10 up
-echo "[netstack] applying iptables base rules (append-only, preserves Docker chains)"
+echo "[netstack] applying open firewall (no blocking, preserves Docker chains)"
 iptables -P INPUT ACCEPT 2>/dev/null || true
-iptables -P FORWARD DROP 2>/dev/null || true
+iptables -P FORWARD ACCEPT 2>/dev/null || true
 iptables -P OUTPUT ACCEPT 2>/dev/null || true
-add_rule() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
-# Samba lockdown: allow 445/139 only from trusted local interfaces
-add_rule INPUT -i lo -p tcp -m multiport --dports 445,139 -j ACCEPT
-add_rule INPUT -i br10 -p tcp -m multiport --dports 445,139 -j ACCEPT
-add_rule INPUT -i wg0 -p tcp -m multiport --dports 445,139 -j ACCEPT
-add_rule INPUT -p tcp -m multiport --dports 445,139 -j DROP
-# Lab forwarding: service net <-> WireGuard, WireGuard <-> uplink + hairpin
-add_rule FORWARD -s 192.168.10.0/24 -i br10 -o wg0 -j ACCEPT
-add_rule FORWARD -d 192.168.10.0/24 -i wg0 -o br10 -j ACCEPT
-add_rule FORWARD -i wg0 -o eth0 -j ACCEPT
-add_rule FORWARD -i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-add_rule FORWARD -i wg0 -o wg0 -j ACCEPT
-/usr/local/sbin/ns10-setup.sh || echo "[netstack] WARNING: ns10 setup failed (non-fatal)"
+# Cleanup: remove any leftover restrictive rules from previous versions
+# (Samba lockdown + lab FORWARD allowlist — redundant now that policies are ACCEPT).
+for _spec in "-p tcp -m multiport --dports 445,139 -j DROP" \
+             "-i lo -p tcp -m multiport --dports 445,139 -j ACCEPT" \
+             "-i br10 -p tcp -m multiport --dports 445,139 -j ACCEPT" \
+             "-i wg0 -p tcp -m multiport --dports 445,139 -j ACCEPT"; do
+    # shellcheck disable=SC2086
+    while iptables -C INPUT $_spec 2>/dev/null; do iptables -D INPUT $_spec 2>/dev/null || break; done
+done
+for _spec in "-s 192.168.10.0/24 -i br10 -o wg0 -j ACCEPT" \
+             "-d 192.168.10.0/24 -i wg0 -o br10 -j ACCEPT" \
+             "-i wg0 -o eth0 -j ACCEPT" \
+             "-i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT" \
+             "-i wg0 -o wg0 -j ACCEPT"; do
+    # shellcheck disable=SC2086
+    while iptables -C FORWARD $_spec 2>/dev/null; do iptables -D FORWARD $_spec 2>/dev/null || break; done
+done
+# Remove legacy lab netns (ns10/veth10) if left over from previous versions.
+ip link del veth10-host 2>/dev/null || true
+ip netns del ns10 2>/dev/null || true
 
 # --- WireGuard interface ---
 if ! wg show wg0 >/dev/null 2>&1; then

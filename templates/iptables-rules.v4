@@ -1,23 +1,14 @@
 # DARKVEDA LAB — iptables base rules (reference only, do NOT iptables-restore directly).
 # Plain `iptables-restore` FLUSHES Docker's DOCKER chains and breaks bridged
-# containers (db/ipam DNAT error). netstack/entrypoint.sh applies these same
-# rules append-only via `iptables -C || iptables -A`. Keep the two in sync.
-# NOTE: outbound iface is eth0 below — change it if yours differs (ens3, enp0s3…).
+# containers (db/ipam DNAT error). netstack/entrypoint.sh sets OPEN policies
+# (INPUT/FORWARD/OUTPUT ACCEPT, no DROP rules) via `iptables -P` + cleanup.
+# Keep the two in sync.
+# Firewall is OPEN by design: no blocking, no per-interface 445/139 rules.
 *filter
 :INPUT ACCEPT [0:0]
-:FORWARD DROP [0:0]
+:FORWARD ACCEPT [0:0]
 :OUTPUT ACCEPT [0:0]
-# Samba lockdown: allow 445/139 only from trusted local interfaces
--A INPUT -i lo -p tcp -m multiport --dports 445,139 -j ACCEPT
--A INPUT -i br10 -p tcp -m multiport --dports 445,139 -j ACCEPT
--A INPUT -i wg0 -p tcp -m multiport --dports 445,139 -j ACCEPT
--A INPUT -p tcp -m multiport --dports 445,139 -j DROP
-# Lab forwarding: service net <-> WireGuard, WireGuard <-> uplink + hairpin
--A FORWARD -s 192.168.10.0/24 -i br10 -o wg0 -j ACCEPT
--A FORWARD -d 192.168.10.0/24 -i wg0 -o br10 -j ACCEPT
--A FORWARD -i wg0 -o eth0 -j ACCEPT
--A FORWARD -i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
--A FORWARD -i wg0 -o wg0 -j ACCEPT
+# No -A rules: all traffic allowed (Docker chains managed by Docker itself).
 COMMIT
 *nat
 :PREROUTING ACCEPT [0:0]

@@ -19,18 +19,10 @@ services:
     privileged: true
     volumes:
       - wgconf:/etc/wireguard
-      - frrconf:/etc/frr
-      - frrrun:/var/run/frr
     environment:
       WG_ADDR: ${WG_ADDR:-10.99.0.1/24}
       WG_PORT: ${WG_PORT:-51820}
       BR10_ADDR: ${BR10_ADDR:-192.168.10.1/24}
-      BGP_AS: ${BGP_AS:-65001}
-      BGP_PEER: ${BGP_PEER:-10.99.0.2}
-      BGP_PEER_AS: ${BGP_PEER_AS:-65002}
-      BGP_ROUTER_ID: ${BGP_ROUTER_ID:-10.99.0.1}
-      ORIGIN_NET: ${ORIGIN_NET:-192.168.10.0/24}
-      HOME_NETS: ${HOME_NETS:-172.16.0.0/24,172.16.10.0/24,172.16.20.0/24,172.16.30.0/24,172.16.100.0/24}
     restart: unless-stopped
 
   portal:
@@ -45,11 +37,11 @@ services:
       - netstack
     volumes:
       - wgconf:/etc/wireguard
-      - frrconf:/etc/frr
-      - frrrun:/var/run/frr
       - smbconf:/etc/samba
       - sambadb:/var/lib/samba
       - shares:/DATA
+      # Default Samba share: host ./sharelab <-> container /DATA/sharelab
+      - ./sharelab:/DATA/sharelab
       - portaldata:/opt/portal/data
       - peers:/opt/portal/peers
       - backups:/opt/portal/backups
@@ -115,8 +107,6 @@ services:
 
 volumes:
   wgconf:
-  frrconf:
-  frrrun:
   smbconf:
   sambadb:
   shares:

@@ -1,108 +1,144 @@
-# DARKVEDA LAB — homelab control center (Docker)
+# DarkvedaLab — homelab control center (Docker)
 
-One `docker compose up` gives you a complete small-lab stack: WireGuard VPN
-with a click-to-manage portal, BGP routing (FRR), Samba file sharing with
-per-user ACLs, a full IPAM with discovery/topology, and multi-vendor network
-device config backups.
+One `docker compose up` gives you a complete small-lab stack: a **WireGuard**
+VPN with a click-to-manage portal, **Samba** file sharing with per-user ACLs,
+a full **IPAM** (subnets, VLANs, discovery, topology), and **multi-vendor
+network device config backups** — ready to use right after install, with
+demo logins `admin` / `admin`.
 
 ```
                         ┌───────────────────────────────┐
                         │  portal :8090  (Flask + Samba) │
-                        │  WireGuard peers · BGP ctl     │
-                        │  shares + ACLs · backups       │
+                        │  WireGuard · shares + ACLs     │
+                        │  backups · services · logs     │
                         └───────┬───────────────┬───────┘
                                 │ volumes       │ 127.0.0.1:9001
                         ┌───────▼───────┐ ┌─────▼─────────┐   ┌────────────┐
                         │ netstack      │ │ ipam :8091    │   │ mariadb    │
-                        │ WG · FRR/BGP  │ │ subnets · VLAN │◄─►│  (loopback │
-                        │ iptables·br10 │ │ discovery ·    │   │   only)    │
+                        │ WG · br10     │ │ subnets · VLAN │◄─►│  (loopback │
+                        │ open firewall │ │ discovery ·    │   │   only)    │
                         └───────────────┘ │ topology ·     │   └────────────┘
                                           │ monitoring     │
                                           └────────────────┘
 ```
 
-## Services & default logins (demo build)
+## Prerequisites (read before installing)
 
-> ⚠️ **Demo credentials are intentionally trivial so anyone can try it.**
-> Change every password before exposing this to the internet or real data.
+| Need | Minimum / notes |
+| ---- | --------------- |
+| Host OS | Ubuntu 22.04/24.04 (Debian 12 works too), amd64 |
+| Kernel | WireGuard support (`ls /sys/module/wireguard`, or kernel ≥ 5.6) |
+| Docker | Engine ≥ 24 **+ Compose plugin** (`docker compose version` must work) |
+| RAM / disk | 2 GB RAM, 10 GB free (MariaDB + backups grow over time) |
+| Network | A static LAN IP; UDP **51820** reachable from wherever VPN peers are |
+| Ports used | 8090 portal · 8091 IPAM · 51820/udp WireGuard · 445/139 Samba |
 
-| Service              | URL / port              | Login              |
-| -------------------- | ----------------------- | ------------------ |
-| Portal (control UI)  | `http://HOST:8090/`     | `admin` / `admin`  |
-| Samba file share     | `\\HOST\lab` (445)      | `admin` / `admin`  |
-| IPAM                 | `http://HOST:8091/`     | `admin` / `adminadmin` (app requires ≥ 10 chars) |
-| MVNBC backups        | inside portal (MVNBC tab, devices in `mvnbc/`) | n/a |
+> `netstack` + `portal` run **privileged with host networking** because they
+> manage kernel WireGuard, iptables and bridges — the same job as a native
+> install, just packaged. Do not run them unprivileged or rootless.
 
-## Quick start
+## Quick start (ready to use)
 
 ```bash
 git clone https://github.com/Darkveda05/DARKVEDALAB.git
 cd DARKVEDALAB
-cp .env.example .env          # review it — passwords, subnets, AS numbers
+cp .env.example .env        # review it — passwords, subnets, timezone
 docker compose up -d --build
-docker exec darkveda-portal testparm -s   # sanity: samba config valid
+docker ps --format '{{.Names}}: {{.Status}}'
 ```
 
-Then open `http://HOST:8090/` (portal) and `http://HOST:8091/` (IPAM).
-Full step-by-step, including WireGuard clients, Samba clients, and the
-Zabbix API token for IPAM monitoring, is in **[INSTALL.md](INSTALL.md)**.
+Wait ~60 s on first boot (MariaDB init, WireGuard key generation, Samba
+seeding), then open:
+
+| Service | URL | Demo login |
+| ------- | --- | ---------- |
+| Portal (control UI) | `http://HOST:8090/` | `admin` / `admin` |
+| Samba file share | `\\HOST\sharelab` (445) | `admin` / `admin` (read & write) |
+| IPAM | `http://HOST:8091/` | `admin` / `adminadmin` (app requires ≥ 10 chars) |
+
+First-boot does everything for you: WireGuard server keypair is generated
+(`wgconf` volume), `wg0` comes up with no peers, portal/Samba `admin` accounts
+are created, the `[sharelab]` share exists, and the IPAM database is imported
+with its admin set from `.env`.
+
+> ⚠️ **Demo credentials are public knowledge — this repo is for learning and
+> sharing.** Change every password before exposing anything to the internet
+> or storing real data (portal `/password`, Samba `smbpasswd`, IPAM Users
+> page, plus `DB_PASS`/`DB_ROOT_PASS` in `.env` followed by a DB rebuild).
+
+Full step-by-step (WireGuard clients, Samba clients, Zabbix token, device
+backups) is in **[INSTALL.md](INSTALL.md)**.
 
 ## What's inside
 
-| Path                | What                                                      |
-| ------------------- | --------------------------------------------------------- |
-| `portal/`           | Flask control center + Samba server (Dockerfile included) |
-| `netstack/`         | Privileged network plane: WireGuard, FRR/BGP, iptables, br10 |
-| `ipam/`             | DarkVeda IPAM app (subnets, VLANs, discovery, topology)   |
-| `mvnbc/`            | Multi-vendor device config backup (MikroTik, Cisco, H3C…) |
-| `templates/`        | First-boot configs (WireGuard, FRR, Samba, iptables)      |
-| `scripts/`          | Lab netns helpers (`ns10-setup.sh`) + uninstall (`uninstall.sh`) |
-| `docker-compose.yml`| Wiring: volumes, host networking, healthchecks            |
-| `.env.example`      | Every tunable in one place (copy to `.env`)               |
+| Path | What |
+| ---- | ---- |
+| `portal/` | Flask control center + Samba server (Dockerfile included) |
+| `netstack/` | Privileged network plane: WireGuard, open firewall, `br10` |
+| `ipam/` | DarkVeda IPAM app (subnets, VLANs, discovery, topology, monitoring) |
+| `mvnbc/` | Multi-vendor device config backup (MikroTik, Cisco, H3C…) |
+| `templates/` | First-boot configs (WireGuard, Samba) |
+| `sharelab/` | Default file-share folder (bind-mounted, your files stay out of git) |
+| `scripts/` | Uninstall (`uninstall.sh`) |
+| `docker-compose.yml` | Wiring: volumes, host networking, healthchecks |
+| `.env.example` | Every tunable in one place (copy to `.env`) |
 
 ### Portal tabs
 
-WireGuard (tunnel, peers + QR, routes, full `wg0.conf` editor, BGP control,
-config backups) · Samba (shares, per-user read/write ACLs, sessions, `smb.conf`
-editor) · MVNBC (device backups, compare, schedules, retention) · IPAM
-(subnet summary + links to full app) · Backups (one-click snapshots, download,
-restore) · Logs (journald + container logs) · Setting (card visibility,
-service control with restart + enable/disable).
+* **WireGuard** — interface **Enable/Disable**, **Connected Peers** with per-peer
+  Enable/Disable, managed road-warrior peers (add/remove, QR + `.conf`
+  download), full `wg0.conf` editor with validation + backup.
+* **Samba** — shares, users, per-user read/write ACLs, active sessions,
+  `smb.conf` editor (validated with `testparm`).
+* **MVNBC** — device backups, compare, run-now, schedules, retention, alerts.
+* **IPAM** — subnet summary + link into the full app.
+* **Backups** — one-click snapshots of all configs, download & restore.
+* **Logs** — supervisor/app/Samba logs, WireGuard + kernel (dmesg).
+* **Setting** — card visibility, **Services Control** (Start/Stop/Restart per
+  service and container).
 
 ## How it works
 
-* `netstack` (privileged, host network) owns the kernel pieces: it generates
-  the WireGuard server keypair on first boot, renders configs from
-  `templates/` + `.env`, creates `br10`, restores the iptables base rules,
-  brings up `wg0`, and supervises the FRR daemons (`zebra`, `bgpd`,
-  `staticd`, `mgmtd`).
+* `netstack` (privileged, host network) owns the kernel pieces: generates the
+  WireGuard server keypair on first boot, renders `wg0.conf` from `templates/`
+  + `.env`, creates `br10`, applies an **open** firewall (ACCEPT policies,
+  Docker chains untouched) and brings up `wg0`.
 * `portal` (host network, `systemctl` compatibility shim) manages everything
-  through the *same* commands as a native install (`wg`, `vtysh`,
-  `iptables`, `testparm`, `smbpasswd`) and restarts daemons via supervisord.
-  Set `CTL_MODE=systemd` to run it on a host instead.
-* Peers are added from the portal (keys generated server-side, QR shown);
-  the home/site peer is a regular `[Peer]` with the subnets in AllowedIPs.
-* Samba enforces per-user access with `valid users` + `write list` plus
-  POSIX ACLs on share folders (no `force user` shortcuts).
+  through the same commands as a native install (`wg`, `iptables`, `testparm`,
+  `smbpasswd`) and supervises daemons locally. Set `CTL_MODE=systemd` to run
+  it on a host instead.
+* Peers are added from the portal (keys generated server-side, QR shown).
+  Disabling a peer comments it out of `wg0.conf` (kept, one click to restore);
+  deleting removes it permanently.
+* Samba enforces per-user access with `valid users` + `write list` plus POSIX
+  ACLs on share folders (no `force user` shortcuts).
+* Nothing secret ships in this repo: `.env`, keys, databases, peer configs
+  and backups are all git-ignored — only `*.example` templates with dummy
+  values are committed.
+
+## Going live checklist
+
+- [ ] `.env` passwords changed (DB ×2, IPAM admin, portal admin, Samba admin)
+- [ ] `templates/` addressing matches YOUR subnets (rebuild after change)
+- [ ] UDP 51820 + TCP 8090/8091 reachable as intended; 445/139 is open to any
+      IP by design — firewall it yourself if it must not be public
+- [ ] Test: peer handshake fresh · ping remote subnet · `smbclient -L`
+- [ ] `docker compose logs --tail 50 netstack portal` shows no errors
+- [ ] First snapshot: portal **Backups → Create snapshot now** (+ download copy)
 
 ## Uninstall
 
 ```bash
-cd DARKVEDALAB
+cd DarkvedaLab
 ./scripts/uninstall.sh --help
 ./scripts/uninstall.sh                        # containers + networks, prompts first
 ./scripts/uninstall.sh --purge-data --rm-images -y   # also delete keys, DB, shares, images
 ```
 
-* Default keeps volumes/images and skips `wg0`/`br10`/`ns10`/iptables cleanup
-  while native host units (`wg-quick@wg0`, `frr`, `smbd`) are active.
-* `--purge-data` deletes WireGuard keys, FRR/Samba state, shares, portal data, DB.
-* `--force-host-net` takes down live `wg0`/`br10`/iptables too (drops VPN/BGP).
-* Never touches the standalone `/root/darkveda-ipam` stack.
-* Verify: `docker ps -a | grep darkveda` is empty; `ip link show br10/wg0`
-  and `iptables -S | grep -E 'br10|wg0|445,139'` are empty unless the native
-  stack owns them.
-
+* Default keeps volumes/images and skips `wg0`/`br10`/iptables cleanup while
+  native host units (`wg-quick@wg0`, `smbd`) are active.
+* `--purge-data` deletes WireGuard keys, Samba state, shares, portal data, DB.
+* `--force-host-net` takes down live `wg0`/`br10`/iptables too (drops VPN).
 
 ## License
 

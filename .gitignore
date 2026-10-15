@@ -51,6 +51,12 @@ smbpasswd.tdb
 secrets.tdb
 *.tdb
 
+# --- Default share folder (bind-mounted to /DATA/sharelab) ---
+# Keep the folder + docs in git, ignore user files dropped into the share.
+sharelab/*
+!sharelab/.gitkeep
+!sharelab/README.md
+
 # --- MVNBC live data (real device credentials/configs!) ---
 mvnbc/config/devices.conf
 mvnbc/config/settings.json

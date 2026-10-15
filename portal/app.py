@@ -232,25 +232,8 @@ except Exception:
     pass
 
 # ---- perf: cached heavy subprocess calls ----
-_BGP_CACHE = {"t": 0, "data": None}
-_BGP_TTL = 30
-
 _SMB_CACHE = {"t": 0, "data": None}
 _SMB_TTL = 15
-
-def bgp_correlation_cached():
-    now = time.time()
-    if _BGP_CACHE["data"] is not None and (now - _BGP_CACHE["t"]) < _BGP_TTL:
-        return _BGP_CACHE["data"]
-    try:
-        data = bgp_correlation()
-        _BGP_CACHE["data"] = data
-        _BGP_CACHE["t"] = now
-        return data
-    except Exception:
-        if _BGP_CACHE["data"] is not None:
-            return _BGP_CACHE["data"]
-        return {"local_as": None, "router_id": None, "received_count": 0, "advertised_count": 0, "rows": [], "error": "bgp fetch failed"}
 
 
 # ---------------- Auth core ----------------
@@ -492,7 +475,7 @@ def write_allowed_ips(cidrs):
 
 WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 
-def validate_wg_conf(text):
+def validate_wg_conf(text, require_peer=True):
     """Validate full wg0.conf text. Returns (normalized_text|None, error|None)."""
     if text is None:
         return None, "Empty config."
@@ -504,7 +487,7 @@ def validate_wg_conf(text):
     # must have sections
     if not any(l.strip() == "[Interface]" for l in cleaned):
         return None, "Missing [Interface] section."
-    if not any(l.strip() == "[Peer]" for l in cleaned):
+    if require_peer and not any(l.strip() == "[Peer]" for l in cleaned):
         return None, "Missing [Peer] section (at least one required)."
     section = None
     n_iface = 0
@@ -892,6 +875,201 @@ def wg_syncconf():
             pass
 
 
+WG_IFACE_RE = re.compile(r"^wg[A-Za-z0-9_-]{0,13}$")
+WG_DISABLED_HDR_RE = re.compile(r"^#\s*DISABLED-PEER\s+([A-Za-z0-9+/]{43}=)\s*(.*?)\s*$")
+
+
+def wg_parse_disabled_peers(txt):
+    """Parse commented-out disabled peers from wg0.conf.
+
+    Disabled block format (written by wg_disable_peer_in_text):
+        # DISABLED-PEER <pubkey> <name> <stamp>
+        # [Peer]
+        # PublicKey = <pub>
+        # AllowedIPs = ...
+        # Endpoint = ... (optional)
+        # PersistentKeepalive = ... (optional)
+        # PresharedKey = ... (optional)
+    Returns [{name, public_key, allowed_ips(list), endpoint, keepalive, start, end}].
+    """
+    out = []
+    lines = (txt or "").splitlines()
+    i = 0
+    while i < len(lines):
+        m = WG_DISABLED_HDR_RE.match(lines[i].strip())
+        if not m:
+            i += 1
+            continue
+        pub, rest = m.group(1), (m.group(2) or "").strip()
+        start = i
+        i += 1
+        decoded = []
+        while i < len(lines) and lines[i].strip().startswith("#"):
+            nxt = lines[i].strip()
+            # A new DISABLED-PEER header starts the next block.
+            if WG_DISABLED_HDR_RE.match(nxt):
+                break
+            body = lines[i].lstrip()
+            assert body.startswith("#")
+            decoded.append(body[1:].lstrip())
+            i += 1
+        end = i - 1
+        name = ""
+        allowed = []
+        endpoint = None
+        keepalive = None
+        file_pub = ""
+        for dl in decoded:
+            if "=" in dl:
+                k, v = [x.strip() for x in dl.split("=", 1)]
+                kl = k.lower()
+                if kl == "publickey":
+                    file_pub = v
+                elif kl == "allowedips":
+                    allowed = [t.strip() for t in re.split(r"[,\s]+", v) if t.strip()]
+                elif kl == "endpoint":
+                    endpoint = v or None
+                elif kl == "persistentkeepalive":
+                    keepalive = v or None
+        # Header remainder is "<name> <stamp>" — name may contain spaces.
+        if rest:
+            parts = rest.rsplit(None, 1)
+            if len(parts) == 2 and re.fullmatch(r"\d{14}", parts[1] or ""):
+                name = parts[0]
+            else:
+                name = rest
+        if file_pub and file_pub != pub:
+            continue
+        if not file_pub:
+            continue
+        out.append({"name": name, "public_key": file_pub,
+                    "allowed_ips": allowed, "endpoint": endpoint,
+                    "keepalive": keepalive, "start": start, "end": end})
+    return out
+
+
+def wg_disable_peer_in_text(txt, pub):
+    """Comment a peer out of wg0.conf into a DISABLED-PEER block. Returns (new_txt, err, name)."""
+    peers = wg_parse_peers(txt or "")
+    hit = next((p for p in peers if p.get("public_key") == pub), None)
+    if not hit:
+        if any(d.get("public_key") == pub for d in wg_parse_disabled_peers(txt or "")):
+            return None, "Peer is already disabled.", None
+        return None, "Peer not found in wg0.conf.", None
+    lines = (txt or "").splitlines()
+    s, e = hit["start"], hit.get("end", hit["start"])
+    while s > 0 and lines[s - 1].strip().startswith(("#", ";")):
+        s -= 1
+    block = lines[s:e + 1]
+    # Rebuild as commented block (preserve original key lines only).
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    name = (hit.get("name") or "").strip()
+    hdr = f"# DISABLED-PEER {pub} {name} {stamp}".rstrip()
+    keep = []
+    for bl in block:
+        t = bl.strip()
+        if not t or t.startswith(("#", ";")):
+            continue
+        if re.match(r"^\[Peer\]$", t, re.I):
+            keep.append("# [Peer]")
+        elif "=" in t:
+            k, v = [x.strip() for x in t.split("=", 1)]
+            if k in ("PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive", "PresharedKey"):
+                keep.append(f"# {k} = {v}")
+    if not any("PublicKey" in k for k in keep):
+        keep.append(f"# PublicKey = {pub}")
+    if not any("AllowedIPs" in k for k in keep):
+        keep.append("# AllowedIPs = " + ", ".join(hit.get("allowed_ips") or []))
+    remaining = lines[:s] + lines[e + 1:]
+    new_txt = "\n".join(remaining).rstrip("\n") + "\n\n" + hdr + "\n" + "\n".join(keep) + "\n"
+    return new_txt, None, (name or pub[:12])
+
+
+def wg_enable_peer_in_text(txt, pub):
+    """Restore a DISABLED-PEER block back to an active [Peer] block. Returns (new_txt, err, peer)."""
+    disabled = wg_parse_disabled_peers(txt or "")
+    hit = next((d for d in disabled if d.get("public_key") == pub), None)
+    if not hit:
+        if any(p.get("public_key") == pub for p in wg_parse_peers(txt or "")):
+            return None, "Peer is already enabled.", None
+        return None, "Disabled peer not found in wg0.conf.", None
+    lines = (txt or "").splitlines()
+    s, e = hit["start"], hit["end"]
+    rebuild = []
+    if hit.get("name"):
+        rebuild.append(f"# {hit['name']}")
+    rebuild.append("[Peer]")
+    rebuild.append(f"PublicKey = {pub}")
+    if hit.get("allowed_ips"):
+        rebuild.append("AllowedIPs = " + ", ".join(hit["allowed_ips"]))
+    if hit.get("endpoint"):
+        rebuild.append(f"Endpoint = {hit['endpoint']}")
+    if hit.get("keepalive") is not None:
+        rebuild.append(f"PersistentKeepalive = {hit['keepalive']}")
+    remaining = lines[:s] + lines[e + 1:]
+    new_txt = "\n".join(remaining).rstrip("\n") + "\n\n" + "\n".join(rebuild) + "\n"
+    return new_txt, None, hit
+
+
+def wg_write_conf_atomic(new_txt):
+    """Backup + atomic write of wg0.conf (chmod 600). Returns (ok, err)."""
+    try:
+        wg_backup_conf()
+    except OSError as e:
+        return False, f"Backup failed, aborting: {e}"
+    try:
+        fd = os.open(WG_CONF + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(new_txt)
+        os.rename(WG_CONF + ".tmp", WG_CONF)
+        os.chmod(WG_CONF, 0o600)
+    except OSError as e:
+        return False, f"Write failed: {e}"
+    return True, ""
+
+
+def wg_iface_set_state(iface, up):
+    """Bring a WireGuard interface up/down. Returns (ok, msg)."""
+    action = "up" if up else "down"
+    verb = "enabled" if up else "disabled"
+    # Primary path: systemd unit (host) / shim (docker, maps to wg-quick).
+    unit = f"wg-quick@{iface}"
+    r = subprocess.run(["systemctl", "start" if up else "stop", unit],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode == 0:
+        time.sleep(1)
+    else:
+        # Fallback: wg-quick directly (needs config file for up).
+        q = subprocess.run(["wg-quick", action, iface],
+                           capture_output=True, text=True, timeout=30)
+        if q.returncode != 0 and not up:
+            # Last resort for down: admin-down the link, config stays.
+            subprocess.run(["ip", "link", "set", iface, "down"],
+                           capture_output=True, timeout=10)
+    chk = subprocess.run(["ip", "link", "show", iface],
+                         capture_output=True, text=True, timeout=5)
+    if chk.returncode != 0:
+        if not up:
+            return True, f"{iface} disabled (interface removed)."
+        return False, f"{iface} not present after start: {(chk.stderr or chk.stdout or '').strip()[:150]}"
+    out = (chk.stdout or "")
+    is_down = "state DOWN" in out or " DOWN " in out.split("\n")[0]
+    if up and is_down:
+        # Link exists but admin down — try plain `ip link set up`.
+        subprocess.run(["ip", "link", "set", iface, "up"],
+                       capture_output=True, timeout=10)
+        time.sleep(1)
+        chk = subprocess.run(["ip", "link", "show", iface],
+                             capture_output=True, text=True, timeout=5)
+        out = (chk.stdout or "")
+        is_down = "state DOWN" in out
+        if is_down:
+            return False, f"{iface} still DOWN after start."
+    if not up and not is_down:
+        return False, f"{iface} still UP (stop failed)."
+    return True, f"{iface} {verb}."
+
+
 def wg_client_config(client_priv, client_ip, endpoint, dns):
     lines = ["[Interface]",
              f"PrivateKey = {client_priv}",
@@ -1027,144 +1205,6 @@ def parse_routes():
             routes.append(line)
     return routes
 
-def parse_bgp_summary():
-    """Get BGP neighbor summary via FRR"""
-    raw = run_cmd("vtysh -c 'show ip bgp summary' 2>&1")
-    peers = []
-    lines = raw.strip().split('\n')
-
-    for line in lines:
-        # Match FRR format:
-        # 10.99.0.2       4      65002      1212      1213        5    0    0 20:08:38            4        1 N/A
-        match = re.match(r'(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)', line)
-        if match:
-            peers.append({
-                "neighbor": match.group(1),
-                "remote_as": match.group(3),
-                "state": match.group(12) if match.group(12) != 'N/A' else 'Established',
-                "pfx_rcd": match.group(10),
-                "up_time": match.group(9)
-            })
-
-    return {"peers": peers, "raw": raw[:500] if not peers else None}
-
-def parse_bgp_detail():
-    """JSON-based BGP detail: local AS, prefixes, nexthops. Falls back to text on failure."""
-    out = {"local_as": None, "router_id": None, "received": [], "advertised": [], "peers": [], "error": None}
-    try:
-        r = subprocess.run(["vtysh", "-c", "show ip bgp summary json"], capture_output=True, text=True, timeout=8)
-        if r.returncode == 0 and r.stdout.strip():
-            j = json.loads(r.stdout)
-            uni = j.get("ipv4Unicast", j)
-            out["local_as"] = uni.get("as") or uni.get("localAS")
-            out["router_id"] = uni.get("routerId")
-            for nip, pinfo in (uni.get("peers", {}) or {}).items():
-                out["peers"].append({
-                    "neighbor": nip,
-                    "remote_as": pinfo.get("remoteAs"),
-                    "state": pinfo.get("state", "Established"),
-                    "pfx_rcd": pinfo.get("pfxRcd", 0),
-                    "pfx_snt": pinfo.get("pfxSnt", 0),
-                    "up_time": pinfo.get("peerUptime", ""),
-                })
-    except Exception as ex:
-        out["error"] = str(ex)[:200]
-    try:
-        r2 = subprocess.run(["vtysh", "-c", "show ip bgp json"], capture_output=True, text=True, timeout=8)
-        if r2.returncode == 0 and r2.stdout.strip():
-            j2 = json.loads(r2.stdout)
-            routes = j2.get("routes", {})
-            if out["local_as"] is None:
-                out["local_as"] = j2.get("localAS")
-            if out["router_id"] is None:
-                out["router_id"] = j2.get("routerId")
-            for net, paths in routes.items():
-                for pth in (paths or []):
-                    nhs = pth.get("nexthops", []) or []
-                    nh = (nhs[0].get("ip") if nhs else "") or ""
-                    entry = {"prefix": net, "nexthop": nh, "peer": pth.get("peerId", ""), "path": pth.get("path", ""), "valid": bool(pth.get("valid")), "best": bool(pth.get("bestpath"))}
-                    if nh == "0.0.0.0" or (pth.get("peerId") in ("(unspec)", None, "")):
-                        out["advertised"].append(entry)
-                    else:
-                        out["received"].append(entry)
-    except Exception as ex:
-        if not out["error"]:
-            out["error"] = str(ex)[:200]
-    return out
-
-def bgp_correlation():
-    """Correlate BGP prefixes with WG peer AllowedIPs + kernel routes."""
-    det = parse_bgp_detail()
-    try:
-        kr = subprocess.run(["ip", "route", "show"], capture_output=True, text=True, timeout=5)
-        kroutes = (kr.stdout or "").splitlines()
-    except Exception:
-        kroutes = []
-    try:
-        wg = parse_wg_show()
-    except Exception:
-        wg = {"interfaces": []}
-    # peer allowed nets
-    peer_nets = []  # [(shortkey, endpoint, [ip_network,...], fullkey)]
-    for iface in (wg.get("interfaces") or []):
-        for p in (iface.get("peers") or []):
-            nets = []
-            for tok in (p.get("allowed_ips") or "").split(","):
-                tok = tok.strip()
-                if not tok:
-                    continue
-                try:
-                    nets.append(ipaddress.ip_network(tok, strict=False))
-                except ValueError:
-                    pass
-            peer_nets.append({
-                "key": (p.get("public_key") or "")[:12],
-                "full": p.get("public_key") or "",
-                "endpoint": p.get("endpoint") or "",
-                "nets": nets,
-            })
-    rows = []
-    for e in det.get("received", []):
-        try:
-            pfx = ipaddress.ip_network(e["prefix"], strict=False)
-        except ValueError:
-            continue
-        covering = [pn["key"] for pn in peer_nets if any(pfx.subnet_of(n) or pfx == n for n in pn["nets"])]
-        in_kernel = any(l.split()[0] == str(pfx) and "wg" in l for l in kroutes if l.split())
-        if not covering:
-            status = "NOT_IN_WG"
-        elif not in_kernel:
-            status = "NO_KERNEL_ROUTE"
-        else:
-            status = "OK"
-        rows.append({"prefix": str(pfx), "nexthop": e.get("nexthop"), "path": e.get("path"),
-                     "wg_peers": covering, "in_kernel": in_kernel, "status": status, "dir": "received"})
-    for e in det.get("advertised", []):
-        rows.append({"prefix": e.get("prefix"), "nexthop": e.get("nexthop"), "path": e.get("path", "local"),
-                     "wg_peers": [], "in_kernel": True, "status": "ADVERTISED", "dir": "advertised"})
-    # WG-only nets missing from BGP
-    bgp_set = set()
-    for e in det.get("received", []):
-        try:
-            bgp_set.add(ipaddress.ip_network(e["prefix"], strict=False))
-        except ValueError:
-            pass
-    for pn in peer_nets:
-        for n in pn["nets"]:
-            if n.prefixlen == 32:
-                continue
-            if not any(n == b for b in bgp_set) and not any(n.subnet_of(b) or b.subnet_of(n) for b in bgp_set):
-                in_kernel = any(l.split()[0] == str(n) for l in kroutes if l.split())
-                rows.append({"prefix": str(n), "nexthop": "-", "path": "-",
-                             "wg_peers": [pn["key"]], "in_kernel": in_kernel, "status": "MISSING_IN_BGP", "dir": "wg-only"})
-    det_peers = det.get("peers") or []
-    return {"local_as": det.get("local_as"), "router_id": det.get("router_id"),
-            "neighbor": det_peers[0].get("neighbor") if det_peers else None,
-            "remote_as": det_peers[0].get("remote_as") if det_peers else None,
-            "state": det_peers[0].get("state") if det_peers else None,
-            "received_count": len(det.get("received", [])), "advertised_count": len(det.get("advertised", [])),
-            "rows": rows, "error": det.get("error")}
-
 def format_bytes(b):
     for unit in ['B', 'KB', 'MB', 'GB']:
         if b < 1024:
@@ -1266,7 +1306,6 @@ def api_status():
     wg = parse_wg_show()
     ips = parse_ip_addr()
     routes = parse_routes()
-    bgp = parse_bgp_summary()
 
     # Merge interface info with IP addresses
     for iface in wg.get('interfaces', []):
@@ -1286,95 +1325,49 @@ def api_status():
             eff = 'IDLE'
         iface['kernel_state'] = kernel
         iface['effective_state'] = eff
+        iface['disabled_peers'] = []
+
+    # Disabled peers live commented-out in wg0.conf (single source of truth).
+    try:
+        with open(WG_CONF) as f:
+            _disabled = wg_parse_disabled_peers(f.read())
+    except OSError:
+        _disabled = []
+    # A stopped interface vanishes from `wg show` — keep a stub row so the
+    # UI still offers an Enable button instead of an empty table.
+    _names = {i.get('name') for i in wg.get('interfaces', [])}
+    if WG_IFACE not in _names:
+        _info = ips.get(WG_IFACE, {})
+        _kernel = (_info.get('state') or 'DOWN').upper()
+        if _kernel not in ('DOWN', 'MISSING', 'UNKNOWN', 'UP'):
+            _kernel = 'DOWN'
+        if _kernel in ('UNKNOWN', 'UP'):
+            # Interface config exists but kernel link is gone: treat as DOWN.
+            _kernel = 'DOWN'
+        wg.setdefault('interfaces', []).append({
+            "name": WG_IFACE, "public_key": "", "listen_port": "",
+            "fwmark": "", "peers": [], "ip_info": _info,
+            "kernel_state": _kernel, "effective_state": "DOWN",
+            "disabled_peers": [],
+        })
+    for iface in wg.get('interfaces', []):
+        if iface.get('name') == WG_IFACE:
+            iface['disabled_peers'] = [
+                {"name": d.get("name") or "", "public_key": d.get("public_key") or "",
+                 "public_short": ((d.get("public_key") or "")[:12] + "…"),
+                 "allowed_ips": d.get("allowed_ips") or [],
+                 "endpoint": d.get("endpoint")}
+                for d in _disabled
+            ]
+        else:
+            iface.setdefault('disabled_peers', [])
 
     return jsonify({
         "timestamp": datetime.now(MYTZ).isoformat(),
         "wg": wg,
         "routes": routes,
-        "bgp": bgp,
-        "bgp_corr": bgp_correlation_cached(),
         "uptime": run_cmd("uptime -p")
     })
-
-@app.route('/api/bgp/correlation')
-@login_required
-def api_bgp_corr():
-    return jsonify(bgp_correlation_cached())
-
-
-BGP_ANNOUNCE_PREFIX = "192.168.10.0/24"
-
-
-def bgp_origin_announced():
-    """True if `network 192.168.10.0/24` is configured locally (FRR running-config)."""
-    try:
-        r = subprocess.run(["vtysh", "-c", "show running-config"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return None
-        return bool(re.search(r"^\s*network\s+192\.168\.10\.0/24\s*$", r.stdout or "", re.M))
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-@app.route('/api/bgp/origin', methods=["GET"])
-@login_required
-def api_bgp_origin():
-    announced = bgp_origin_announced()
-    if announced is None:
-        return jsonify({"ok": False, "error": "FRR query failed."}), 500
-    return jsonify({"ok": True, "prefix": BGP_ANNOUNCE_PREFIX, "announced": announced})
-
-
-@app.route('/api/bgp/announce', methods=["POST"])
-@login_required
-def api_bgp_announce():
-    check_csrf()
-    body = request.get_json(silent=True) or {}
-    action = (body.get("action") or "").strip().lower()
-    if action not in ("announce", "withdraw"):
-        return jsonify({"ok": False, "error": "action must be announce or withdraw."}), 400
-    verb = "" if action == "announce" else "no "
-    seq = ["configure", "router bgp 65001", "address-family ipv4 unicast",
-           f"{verb}network {BGP_ANNOUNCE_PREFIX}", "end", "write"]
-    args = []
-    for c in seq:
-        args += ["-c", c]
-    try:
-        r = subprocess.run(["vtysh"] + args, capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return jsonify({"ok": False, "error": f"vtysh failed: {e}"}), 500
-    if r.returncode != 0:
-        return jsonify({"ok": False, "error": (r.stderr or r.stdout or "vtysh failed").strip()[:300]}), 500
-    time.sleep(2)
-    now = bgp_origin_announced()
-    want = (action == "announce")
-    if now != want:
-        return jsonify({"ok": False, "error": "FRR accepted the change but running-config does not reflect it."}), 500
-    try:
-        subprocess.run(["vtysh", "-c", "clear ip bgp 10.99.0.2 soft"],
-                       capture_output=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return jsonify({"ok": True,
-                    "message": f"{BGP_ANNOUNCE_PREFIX} {'announced' if want else 'withdrawn'} & saved."}), 200
-
-
-@app.route('/api/bgp/reset', methods=["POST"])
-@login_required
-def api_bgp_reset():
-    check_csrf()
-    body = request.get_json(silent=True) or {}
-    if (body.get("confirm") or "").strip().lower() != "reset":
-        return jsonify({"ok": False, "error": "Type 'reset' to confirm."}), 400
-    try:
-        r = subprocess.run(["vtysh", "-c", "clear ip bgp 10.99.0.2 soft"],
-                           capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return jsonify({"ok": False, "error": f"vtysh failed: {e}"}), 500
-    if r.returncode != 0:
-        return jsonify({"ok": False, "error": (r.stderr or r.stdout or "reset failed").strip()[:200]}), 500
-    return jsonify({"ok": True, "message": "BGP soft reset sent to 10.99.0.2."}), 200
 
 @app.route('/api/wg/traffic/history')
 @login_required
@@ -1434,15 +1427,6 @@ def api_search():
             iface_hay = " ".join([iface.get("name") or "", iface.get("effective_state") or ""]).lower()
             if q in iface_hay and len(out) < 30:
                 push("wg_iface", iface.get("name",""), iface.get("effective_state",""), "tab:wg")
-    except Exception:
-        pass
-    # BGP
-    try:
-        bgp = parse_bgp_summary()
-        for bp in (bgp.get("peers") or []):
-            hay = " ".join([bp.get("neighbor") or "", str(bp.get("remote_as") or ""), bp.get("state") or ""]).lower()
-            if q in hay and len(out) < 30:
-                push("bgp", "%s AS%s" % (bp.get("neighbor"), bp.get("remote_as")), bp.get("state",""), "tab:wg")
     except Exception:
         pass
     # routes
@@ -1577,6 +1561,79 @@ def api_restart_wg():
     return jsonify({"ok": ok, "message": msg}), status
 
 
+@app.route('/api/wg/iface', methods=["POST"])
+@login_required
+def api_wg_iface():
+    """Enable (up) / disable (down) a WireGuard interface."""
+    check_csrf()
+    body = request.get_json(silent=True) or {}
+    iface = (body.get("iface") or body.get("interface") or "").strip()
+    action = (body.get("action") or "").strip().lower()
+    if not WG_IFACE_RE.match(iface):
+        return jsonify({"ok": False, "error": "Unknown interface."}), 400
+    if action in ("enable", "up", "start"):
+        up = True
+    elif action in ("disable", "down", "stop"):
+        up = False
+    else:
+        return jsonify({"ok": False, "error": "action must be enable or disable."}), 400
+    ok, msg = wg_iface_set_state(iface, up)
+    return jsonify({"ok": ok, "message": msg} if ok else {"ok": False, "error": msg}), (200 if ok else 500)
+
+
+@app.route('/api/wg/peer-toggle', methods=["POST"])
+@login_required
+def api_wg_peer_toggle():
+    """Disable (comment out of wg0.conf + live remove) or enable (restore + syncconf) a peer."""
+    check_csrf()
+    body = request.get_json(silent=True) or {}
+    pub = (body.get("public_key") or body.get("pub") or "").strip()
+    action = (body.get("action") or "").strip().lower()
+    if not WG_KEY_RE.match(pub):
+        return jsonify({"ok": False, "error": "Valid peer public key required."}), 400
+    if action not in ("enable", "disable"):
+        return jsonify({"ok": False, "error": "action must be enable or disable."}), 400
+    try:
+        with open(WG_CONF) as f:
+            orig = f.read()
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"Cannot read {WG_CONF}: {e}"}), 500
+    if action == "disable":
+        new_txt, err, name = wg_disable_peer_in_text(orig, pub)
+        if err:
+            code = 409 if "already" in err else 404
+            return jsonify({"ok": False, "error": err}), code
+        normalized, verr = validate_wg_conf(new_txt, require_peer=False)
+        if verr:
+            return jsonify({"ok": False, "error": f"Resulting config invalid: {verr}"}), 500
+        ok, werr = wg_write_conf_atomic(normalized)
+        if not ok:
+            return jsonify({"ok": False, "error": werr}), 500
+        r = subprocess.run(["wg", "set", WG_IFACE, "peer", pub, "remove"],
+                           capture_output=True, text=True, timeout=10)
+        live = "" if r.returncode == 0 else " (live remove skipped — interface down?)"
+        return jsonify({"ok": True, "message": f"Peer '{name}' disabled{live}."}), 200
+    new_txt, err, _hit = wg_enable_peer_in_text(orig, pub)
+    if err:
+        code = 409 if "already" in err else 404
+        return jsonify({"ok": False, "error": err}), code
+    normalized, verr = validate_wg_conf(new_txt)
+    if verr:
+        return jsonify({"ok": False, "error": f"Resulting config invalid: {verr}"}), 500
+    ok, werr = wg_write_conf_atomic(normalized)
+    if not ok:
+        return jsonify({"ok": False, "error": werr}), 500
+    ok, sync_err = wg_syncconf()
+    if ok:
+        return jsonify({"ok": True, "message": "Peer enabled & applied live (no drop)."}), 200
+    # Interface may be down — config is saved, it applies on next start.
+    chk = subprocess.run(["ip", "link", "show", WG_IFACE],
+                         capture_output=True, text=True, timeout=5)
+    if chk.returncode != 0 or "state DOWN" in (chk.stdout or ""):
+        return jsonify({"ok": True, "message": "Peer enabled in config (interface down — applies on start)."}), 200
+    return jsonify({"ok": False, "error": f"Saved but live apply failed: {sync_err}"}), 500
+
+
 @app.route('/api/wg/peers', methods=["GET"])
 @login_required
 def api_wg_peers():
@@ -1601,7 +1658,15 @@ def api_wg_peers():
             "rx": li.get("rx_human"), "tx": li.get("tx_human"),
             "has_client": os.path.isfile(os.path.join(PEER_DIR, (pub[:16] or "x") + ".conf")),
         })
-    return jsonify({"ok": True, "peers": peers, "suggest_ip": wg_suggest_ip(txt),
+    return jsonify({"ok": True, "peers": peers,
+                    "disabled": [{
+                        "name": d.get("name") or "", "public_key": d.get("public_key") or "",
+                        "public_short": ((d.get("public_key") or "")[:12] + "…"),
+                        "allowed_ips": d.get("allowed_ips") or [],
+                        "endpoint": d.get("endpoint"),
+                        "has_client": os.path.isfile(os.path.join(PEER_DIR, ((d.get("public_key") or "x")[:16]) + ".conf")),
+                    } for d in wg_parse_disabled_peers(txt)],
+                    "suggest_ip": wg_suggest_ip(txt),
                     "endpoint_default": wg_default_endpoint()})
 
 
@@ -1723,7 +1788,27 @@ def api_wg_peer_del():
     peers = wg_parse_peers(orig)
     hit = next((p for p in peers if p["public_key"] == pub), None)
     if not hit:
-        return jsonify({"ok": False, "error": "Peer not found in wg0.conf."}), 404
+        # Purge a disabled (commented-out) peer permanently.
+        dhit = next((d for d in wg_parse_disabled_peers(orig) if d.get("public_key") == pub), None)
+        if not dhit:
+            return jsonify({"ok": False, "error": "Peer not found in wg0.conf."}), 404
+        if not wg_peer_deletable({"allowed_ips": dhit.get("allowed_ips") or []}):
+            return jsonify({"ok": False, "error": "Refusing to delete: not a road-warrior (/32) peer (site peer protected)."}), 403
+        dlines = orig.splitlines()
+        ds, de = dhit["start"], dhit["end"]
+        new_txt = "\n".join(dlines[:ds] + dlines[de + 1:]).rstrip("\n") + "\n"
+        normalized, err = validate_wg_conf(new_txt, require_peer=False)
+        if err:
+            return jsonify({"ok": False, "error": f"Resulting config invalid: {err}"}), 500
+        ok, werr = wg_write_conf_atomic(normalized)
+        if not ok:
+            return jsonify({"ok": False, "error": werr}), 500
+        for fn in (pub[:16] + ".conf", pub[:16] + ".png"):
+            try:
+                os.remove(os.path.join(PEER_DIR, fn))
+            except OSError:
+                pass
+        return jsonify({"ok": True, "message": f"Disabled peer '{dhit.get('name') or pub[:12]}' purged."}), 200
     if not wg_peer_deletable(hit):
         return jsonify({"ok": False, "error": "Refusing to delete: not a road-warrior (/32) peer (site peer protected)."}), 403
     lines = orig.splitlines()
@@ -1795,11 +1880,9 @@ BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 BACKUP_FILES = [
     "/etc/network/interfaces",
     "/etc/wireguard/wg0.conf",
-    "/etc/frr/frr.conf",
     "/etc/iptables/rules.v4",
     "/etc/iptables/rules.v6",
     "/etc/samba/smb.conf",
-    "/etc/systemd/system/ns10.service",
 ]
 BACKUP_NAME_RE = re.compile(r"^[A-Za-z0-9._\-]+\.tar\.gz$")
 
@@ -1967,12 +2050,10 @@ def api_backup_restore():
         r = subprocess.run(["ip6tables-restore", "/etc/iptables/rules.v6"],
                            capture_output=True, text=True, timeout=15)
         steps.append("iptables-restore v6: " + ("OK" if r.returncode == 0 else "FAILED"))
-    for svc, label in [("wg-quick@wg0", "wg-quick"), ("frr", "frr"),
-                       ("smbd", "smbd"), ("ns10.service", "ns10")]:
+    for svc, label in [("wg-quick@wg0", "wg-quick"),
+                       ("smbd", "smbd")]:
         if ((svc == "wg-quick@wg0" and WG_CONF in applied)
-                or (svc == "frr" and "/etc/frr/frr.conf" in applied)
-                or (svc == "smbd" and SMB_CONF in applied)
-                or (svc == "ns10.service" and "/etc/systemd/system/ns10.service" in applied)):
+                or (svc == "smbd" and SMB_CONF in applied)):
             r = subprocess.run(["systemctl", "restart", svc],
                                capture_output=True, text=True, timeout=30)
             steps.append(f"restart {label}: " + ("OK" if r.returncode == 0 else "FAILED"))
@@ -2023,7 +2104,9 @@ def api_samba_conf_post():
         orig = smb_read_conf()
     except OSError as e:
         return jsonify({"ok": False, "error": f"Cannot read {SMB_CONF}: {e}"}), 500
-    normalized = raw.rstrip("\n") + "\n"
+    # Open access: strip any `hosts allow` / `hosts deny` lines — Samba is
+    # reachable from any IP (auth still via valid users).
+    normalized = re.sub(r"(?mi)^[ \t]*hosts\s+(allow|deny)\s*=.*(?:\n|$)", "", raw).rstrip("\n") + "\n"
     if normalized == orig:
         return jsonify({"ok": True, "message": "No changes."}), 200
     try:
@@ -2044,22 +2127,23 @@ def api_samba_conf_post():
 
 SERVICE_UNITS = [
     ("wg-quick@wg0", "WireGuard tunnel (wg0)"),
-    ("frr", "FRRouting (BGP/Zebra)"),
     ("smbd", "Samba (smbd)"),
-    ("ns10.service", "Lab netns (ns10 on br10)"),
-    ("netfilter-persistent", "Saved firewall rules loader"),
     ("networking", "Network interfaces (ifupdown)"),
      ("darkveda-lab", "This portal (darkveda-lab)"),
 ]
 # Restarting networking drops this very session — status only, never restartable here.
 SERVICE_NO_RESTART = {"networking"}
+# Runtime start/stop: only safe units. networking is status-only, and
+# darkveda-lab is restart-only (stopping the portal from inside itself
+# would kill this very session).
+SERVICE_START_STOP = {"wg-quick@wg0", "smbd"}
 
 
 def lab_containers():
-    """Lab-only Docker containers (Darkveda IPAM stack + big-bear apps)."""
+    """Lab-only Docker containers (Darkveda IPAM stack + big-bear apps), running or stopped."""
     out = []
     try:
-        r = subprocess.run(["docker", "ps", "--format", "{{.Names}} {{.Image}} {{.Status}}"],
+        r = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}} {{.Image}} {{.Status}}"],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             for line in (r.stdout or "").splitlines():
@@ -2073,7 +2157,12 @@ def lab_containers():
                         or "darkveda" in image):
                     continue
                 out.append({"unit": name, "label": f"{name} ({image})", "kind": "docker",
-                            "active": status, "enabled": "", "restartable": True})
+                            "active": status, "enabled": "", "restartable": True,
+                            "running": status.startswith("Up"),
+                            # Never offer Stop for the portal itself: a manual
+                            # `docker stop` sticks (unless-stopped won't revive
+                            # it) and would strand you with no UI to start it.
+                            "startable": name != "darkveda-portal"})
     except (OSError, subprocess.TimeoutExpired):
         pass
     return out
@@ -2096,7 +2185,8 @@ def service_status():
             enabled = "unknown"
         units.append({"unit": unit, "label": label, "kind": "systemd",
                       "active": active, "enabled": enabled,
-                      "restartable": unit not in SERVICE_NO_RESTART})
+                      "restartable": unit not in SERVICE_NO_RESTART,
+                      "startable": unit in SERVICE_START_STOP})
     return {"units": units, "containers": lab_containers()}
 
 
@@ -2158,6 +2248,57 @@ def api_service_restart():
     return jsonify({"ok": False, "error": "kind must be systemd or docker."}), 400
 
 
+@app.route('/api/services/state', methods=["POST"])
+@login_required
+def api_service_state():
+    """Runtime start/stop for a service or container (not autostart — see /enable)."""
+    check_csrf()
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "").strip().lower()
+    if action not in ("start", "stop"):
+        return jsonify({"ok": False, "error": "action must be start or stop."}), 400
+    if (body.get("confirm") or "").strip().lower() != action:
+        return jsonify({"ok": False, "error": f"Type '{action}' to confirm."}), 400
+    kind = (body.get("kind") or "systemd").strip()
+    unit = (body.get("unit") or "").strip()
+    if kind == "systemd":
+        if unit not in SERVICE_START_STOP:
+            return jsonify({"ok": False, "error": "Start/stop not allowed for this unit."}), 403
+        r = subprocess.run(["systemctl", action, unit],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return jsonify({"ok": False, "error": (r.stderr or r.stdout or f"{action} failed").strip()[:200]}), 500
+        time.sleep(2)
+        st = subprocess.run(["systemctl", "is-active", unit],
+                            capture_output=True, text=True, timeout=5)
+        state = st.stdout.strip() or "unknown"
+        if (action == "start") != (state == "active"):
+            return jsonify({"ok": False, "error": f"{unit} state after {action}: {state}."}), 500
+        verb = "started" if action == "start" else "stopped"
+        return jsonify({"ok": True, "message": f"{unit} {verb} ({state})."}), 200
+    if kind == "docker":
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", unit):
+            return jsonify({"ok": False, "error": "Bad container name."}), 400
+        known = {c["unit"] for c in service_status()["containers"]}
+        if unit not in known:
+            return jsonify({"ok": False, "error": "Unknown container."}), 404
+        if unit == "darkveda-portal" and action == "stop":
+            return jsonify({"ok": False, "error": "Refusing to stop the portal itself (use Restart; a manual stop would strand you with no UI)."}), 403
+        r = subprocess.run(["docker", action, unit],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return jsonify({"ok": False, "error": (r.stderr or r.stdout or f"{action} failed").strip()[:200]}), 500
+        time.sleep(2)
+        ins = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", unit],
+                             capture_output=True, text=True, timeout=10)
+        running = (ins.stdout or "").strip() == "true"
+        if (action == "start") != running:
+            return jsonify({"ok": False, "error": f"Container {unit} running={running} after {action}."}), 500
+        verb = "started" if action == "start" else "stopped"
+        return jsonify({"ok": True, "message": f"Container {unit} {verb}."}), 200
+    return jsonify({"ok": False, "error": "kind must be systemd or docker."}), 400
+
+
 @app.route('/api/services/enable', methods=["POST"])
 @login_required
 def api_service_enable():
@@ -2181,6 +2322,98 @@ def api_service_enable():
     return jsonify({"ok": True, "message": f"{unit} {action}d (autostart {state})."}), 200
 
 
+# ---------------- Log viewer ----------------
+# In docker mode there is no journald and no docker CLI inside the portal
+# container, so journalctl/docker-logs sources are empty. Serve supervisor
+# log files + dmesg instead (strict allowlist — never arbitrary paths).
+
+LOG_FILE_MAP = {
+    "portal": ("/var/log/supervisor/portal.log", "Portal (this app)"),
+    "smbd": ("/var/log/supervisor/smbd.log", "Samba (smbd)"),
+    "cron": ("/var/log/supervisor/cron.log", "Cron"),
+    "supervisord": ("/var/log/supervisor/supervisord.log", "Supervisord"),
+    "samba": ("/var/log/samba/log.smbd", "Samba file log"),
+}
+
+# systemd unit -> equivalent source when running under supervisor.
+SYSTEMD_LOG_FALLBACK = {
+    "wg-quick@wg0": ("dmesg", "wireguard"),
+    "smbd": ("file", "smbd"),
+    "networking": ("dmesg", "kernel"),
+    "darkveda-lab": ("file", "portal"),
+}
+
+
+def read_log_tail(name, n):
+    """Tail an allowlisted log file. Returns (ok, text|err)."""
+    if name not in LOG_FILE_MAP:
+        return False, "Unknown log file."
+    path = LOG_FILE_MAP[name][0]
+    try:
+        if os.path.realpath(path) != path or not os.path.isfile(path):
+            return False, f"{path} not present."
+    except OSError as e:
+        return False, str(e)[:150]
+    try:
+        from collections import deque
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return True, "".join(deque(f, maxlen=max(10, min(500, n))))
+    except OSError as e:
+        return False, f"Read failed: {e}"
+
+
+def read_dmesg_tail(filt, n):
+    """Kernel ring buffer, optionally filtered. Returns (ok, text|err)."""
+    try:
+        r = subprocess.run(["dmesg", "--ctime"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            r = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=10)
+        out = (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"dmesg failed: {e}"
+    if not out:
+        return False, "dmesg returned empty (kernel log restricted?)."
+    if (filt or "kernel") == "wireguard":
+        kept = [l for l in out.splitlines()
+                if re.search(r"wireguard|wg0?", l, re.I)]
+        out = "\n".join(kept).strip()
+        if not out:
+            return False, "No wireguard lines in kernel log."
+    lines = out.splitlines()[-max(10, min(500, n)):]
+    return True, "\n".join(lines)
+
+
+def log_sources():
+    """Dropdown sources appropriate for this runtime (systemd host vs supervisor docker)."""
+    ctl = os.environ.get("CTL_MODE", "systemd")
+    if ctl == "systemd":
+        src = [{"kind": "systemd", "value": u, "label": "⚙ " + lbl}
+               for u, lbl in SERVICE_UNITS]
+        for c in lab_containers():
+            src.append({"kind": "docker", "value": c["unit"], "label": "🐳 " + c["unit"]})
+        return src
+    src = [
+        {"kind": "file", "value": "portal", "label": "⚙ Portal (this app)"},
+        {"kind": "file", "value": "smbd", "label": "⚙ Samba (smbd)"},
+        {"kind": "file", "value": "samba", "label": "⚙ Samba file log"},
+        {"kind": "dmesg", "value": "wireguard", "label": "⚡ WireGuard (kernel)"},
+        {"kind": "dmesg", "value": "kernel", "label": "🖥 Kernel (dmesg)"},
+        {"kind": "file", "value": "supervisord", "label": "⚙ Supervisord"},
+        {"kind": "file", "value": "cron", "label": "⚙ Cron"},
+    ]
+    for c in lab_containers():
+        # docker CLI only exists on some builds; list whatever the API can see.
+        src.append({"kind": "docker", "value": c["unit"], "label": "🐳 " + c["unit"]})
+    return src
+
+
+@app.route('/api/logs/sources', methods=["GET"])
+@login_required
+def api_logs_sources():
+    return jsonify({"ok": True, "ctl": os.environ.get("CTL_MODE", "systemd"),
+                    "sources": log_sources()})
+
+
 @app.route('/api/logs', methods=["GET"])
 @login_required
 def api_logs():
@@ -2193,6 +2426,30 @@ def api_logs():
     if kind == "systemd":
         if unit not in {u for u, _ in SERVICE_UNITS}:
             return jsonify({"ok": False, "error": "Unknown unit."}), 404
+        if os.environ.get("CTL_MODE", "systemd") != "systemd":
+            # No journald inside the container: serve the equivalent source.
+            fb = SYSTEMD_LOG_FALLBACK.get(unit)
+            if not fb:
+                return jsonify({"ok": False, "error": "No log source for this unit here."}), 404
+            kind, unit = fb
+        else:
+            cmd = ["journalctl", "-u", unit, "--no-pager", "-n", str(lines),
+                   "--output=short-iso", "--no-hostname"]
+    if kind == "file":
+        ok, out = read_log_tail(unit, lines)
+        if not ok:
+            return jsonify({"ok": False, "error": out}), 500
+        return jsonify({"ok": True, "unit": unit, "kind": kind, "lines": lines,
+                        "output": out[-200000:]}), 200
+    if kind == "dmesg":
+        if unit not in ("wireguard", "kernel"):
+            return jsonify({"ok": False, "error": "Unknown dmesg filter."}), 400
+        ok, out = read_dmesg_tail(unit, lines)
+        if not ok:
+            return jsonify({"ok": False, "error": out}), 500
+        return jsonify({"ok": True, "unit": unit, "kind": kind, "lines": lines,
+                        "output": out[-200000:]}), 200
+    if kind == "systemd":
         cmd = ["journalctl", "-u", unit, "--no-pager", "-n", str(lines),
                "--output=short-iso", "--no-hostname"]
     elif kind == "docker":
@@ -2257,7 +2514,8 @@ def smb_parse_shares():
             "valid_users": params.get("valid users", ""),
             "write_list": wl,
             "writable": writable,
-            "hosts_allow": params.get("hosts allow", "ALL"),
+            # Open access: reachable from any IP. Kept for API compat (always "").
+            "hosts_allow": "",
         })
     return out, None
 
@@ -2350,6 +2608,10 @@ def smb_atomic_write(txt):
     os.rename(SMB_CONF + ".tmp", SMB_CONF)
     os.chmod(SMB_CONF, 0o644)
 
+def smb_strip_host_restrictions(txt):
+    """Remove any `hosts allow` / `hosts deny` lines so shares stay open to any IP."""
+    return re.sub(r"(?mi)^[ \t]*hosts\s+(allow|deny)\s*=.*(?:\n|$)", "", txt)
+
 def smb_apply(orig_txt):
     """Validate with testparm, restart smbd. Rollback conf on invalid."""
     try:
@@ -2368,10 +2630,12 @@ def smb_apply(orig_txt):
         return False, "Config OK but smbd restart failed: " + (r.stderr or "").strip()[:200]
     return True, "Saved & applied. smbd restarted."
 
-def smb_render_section(name, path, comment, valid_users, writable, hosts_allow, write_list=""):
+def smb_render_section(name, path, comment, valid_users, writable, hosts_allow="", write_list=""):
     """Render a share. Access model: read only=yes + write list (per-user RW).
     No force user/group: daemons access files as the connecting user, so
-    filesystem ACLs (managed alongside) are actually enforced per user."""
+    filesystem ACLs (managed alongside) are actually enforced per user.
+    Open access: reachable from any IP — no `hosts allow` / `hosts deny`
+    emitted (hosts_allow arg is ignored, kept only for API compat)."""
     vu = " ".join((valid_users or "").split())
     wl = " ".join((write_list or "").split())
     if writable and not wl:
@@ -2387,10 +2651,7 @@ def smb_render_section(name, path, comment, valid_users, writable, hosts_allow, 
     ]
     if wl:
         lines.append(f"   write list = {wl}")
-    if hosts_allow:
-        lines.append(f"   hosts allow = {hosts_allow}")
-    lines += ["   hosts deny = 0.0.0.0/0",
-              "   create mask = 0664",
+    lines += ["   create mask = 0664",
               "   directory mask = 0775"]
     return "\n".join(lines) + "\n"
 
@@ -2599,16 +2860,12 @@ def _smb_inputs(d, need_name=True):
     valid_users = (d.get("valid_users") or "").strip()
     if not re.fullmatch(r"[a-z_][a-z0-9_\- ]{0,200}", valid_users):
         return None, ("valid_users: samba usernames, space separated (a-z0-9_-)", 400)
-    hosts_allow = (d.get("hosts_allow") or "").strip()
-    if hosts_allow:
-        cidrs, err = validate_cidr_list(hosts_allow)
-        if err:
-            return None, ("hosts allow: " + err, 400)
-        hosts_allow = " ".join(cidrs)
+    # Open access: reachable from any IP. `hosts_allow` input is accepted but
+    # ignored (kept for backward compat with old clients).
     writable = bool(d.get("writable", True))
     return {"name": name, "path": path, "comment": comment,
             "valid_users": valid_users, "writable": writable,
-            "hosts_allow": hosts_allow}, None
+            "hosts_allow": ""}, None
 
 @app.route("/api/samba/shares", methods=["POST"])
 @login_required
@@ -2629,7 +2886,7 @@ def api_samba_share_add():
         return jsonify({"ok": False, "error": f"Share [{data['name']}] already exists"}), 409
     data["write_list"] = data["valid_users"] if data["writable"] else ""
     smb_backup_conf()
-    new_txt = txt.rstrip("\n") + "\n\n" + smb_render_section(**data)
+    new_txt = smb_strip_host_restrictions(txt).rstrip("\n") + "\n\n" + smb_render_section(**data)
     try:
         smb_atomic_write(new_txt)
     except OSError as ex:
@@ -2665,7 +2922,10 @@ def api_samba_share_update():
     new_valid = set(data["valid_users"].split())
     data["write_list"] = data["valid_users"] if data["writable"] else " ".join(sorted(cur_write & new_valid))
     smb_backup_conf()
-    new_txt = txt[:span[0]] + smb_render_section(**data) + "\n" + txt[span[1]:]
+    base_txt = smb_strip_host_restrictions(txt)
+    # spans shift after stripping; re-locate the section in the cleaned text
+    span = smb_section_span(base_txt, data["name"]) or span
+    new_txt = base_txt[:span[0]] + smb_render_section(**data) + "\n" + base_txt[span[1]:]
     try:
         smb_atomic_write(new_txt)
     except OSError as ex:
@@ -2690,13 +2950,15 @@ def api_samba_share_delete():
     if not span:
         return jsonify({"ok": False, "error": f"Share [{name}] not found"}), 404
     smb_backup_conf()
-    new_txt = txt[:span[0]] + txt[span[1]:]
+    new_txt = smb_strip_host_restrictions(txt[:span[0]] + txt[span[1]:])
     try:
         smb_atomic_write(new_txt)
     except OSError as ex:
         return jsonify({"ok": False, "error": f"write failed: {ex}"}), 500
     ok, msg = smb_apply(txt)
-    return jsonify({"ok": ok, "message": msg}), (200 if ok else 500)
+    if not ok:
+        return jsonify({"ok": ok, "message": msg}), 500
+    return jsonify({"ok": ok, "message": msg}), 200
 
 @app.route("/api/samba/shares/browse")
 @login_required
@@ -2835,9 +3097,9 @@ def smb_apply_access_map(username, access, txt, shares_by_name):
         if not span:
             return None, notes, f"Share [{share}] not found in smb.conf."
         rendered = smb_render_section(share, s["path"], s.get("comment", ""),
-                                      " ".join(sorted(valid)), bool(write),
-                                      s.get("hosts_allow", "") if s.get("hosts_allow") != "ALL" else "",
-                                      " ".join(sorted(write)))
+                                       " ".join(sorted(valid)), bool(write),
+                                       "",
+                                       " ".join(sorted(write)))
         new_txt = new_txt[:span[0]] + rendered + "\n" + new_txt[span[1]:]
         if s.get("path") and os.path.isdir(s["path"]):
             ok, msg = smb_path_acl(s["path"], username, "rw" if level == "rw" else ("ro" if level == "ro" else "none"))
@@ -2882,9 +3144,10 @@ def api_samba_access_post():
         txt = smb_read_conf()
     except OSError as e:
         return jsonify({"ok": False, "error": f"Cannot read {SMB_CONF}: {e}"}), 500
-    new_txt, notes, aerr = smb_apply_access_map(user, access, txt, {s["name"]: s for s in shares})
+    new_txt, notes, aerr = smb_apply_access_map(user, access, smb_strip_host_restrictions(txt), {s["name"]: s for s in shares})
     if aerr:
         return jsonify({"ok": False, "error": aerr}), 400
+    new_txt = smb_strip_host_restrictions(new_txt)
     if new_txt == txt and not notes:
         return jsonify({"ok": True, "message": "No changes."}), 200
     smb_backup_conf()
@@ -5129,17 +5392,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <div class="value mono" id="traffic" style="font-size: 1.05em;">...</div>
       <canvas id="trafficSpark"></canvas>
     </div>
-    <div class="status-card" style="--accent: rgba(255,214,120,.7);">
-      <div class="sc-head"><span class="label">BGP Peers</span><span class="sc-ico">&#127760;</span></div>
-      <div class="value" id="bgpStatus">...</div>
-      <div class="detail" id="bgpDetail"></div>
-    </div>
   </div>
 
   <div class="section">
     <h2>WireGuard Interfaces</h2>
     <div class="table-scroll"><table>
-      <thead><tr><th>Interface</th><th>State</th><th>Listen Port</th><th>IP Addresses</th><th>Peers</th></tr></thead>
+      <thead><tr><th>Interface</th><th>State</th><th>Listen Port</th><th>IP Addresses</th><th>Peers</th><th style="text-align:right;">Actions</th></tr></thead>
       <tbody id="ifaceTable"></tbody>
     </table></div>
   </div>
@@ -5150,7 +5408,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <span class="vtitle">Connected Peers</span>
     </div>
     <div class="vendor-block-body"><div class="table-scroll"><table>
-      <thead><tr><th>Status</th><th>Endpoint</th><th>Allowed IPs</th><th>Handshake</th><th>Received</th><th>Sent</th><th>History</th></tr></thead>
+      <thead><tr><th>Status</th><th>Endpoint</th><th>Allowed IPs</th><th>Handshake</th><th>Received</th><th>Sent</th><th>History</th><th style="text-align:right;">Actions</th></tr></thead>
       <tbody id="peerTable"></tbody>
     </table></div></div>
   </div>
@@ -5206,14 +5464,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="section vendor-block collapsed" id="block-wgroutes">
-    <div class="vendor-block-head" data-vid="wgroutes" onclick="toggleSec(\'wgRoutes\',event)">
-      <span class="chevron">&#9654;</span>
-      <span class="vtitle">WG Routes</span>
-    </div>
-    <div class="vendor-block-body"><div class="route-list" id="routeList"></div></div>
-  </div>
-
   <div class="section vendor-block collapsed" id="block-wgconf">
     <div class="vendor-block-head" data-vid="wgconf" onclick="toggleSec(\'wgConf\',event)">
       <span class="chevron">&#9654;</span>
@@ -5236,7 +5486,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
     <div id="restartConfirm" style="display:none; margin-top:12px; background:rgba(210,153,34,.06); border:1px solid rgba(210,153,34,.35); border-radius:12px; padding:16px;">
       <div style="color:#B45309; font-weight:700; margin-bottom:7px;">&#9888; Restart WireGuard tunnel?</div>
-      <div class="dim" style="font-size:.83em; margin-bottom:11px;">Tunnel akan drop sekejap &lt; 10s. BGP session mungkin re-establish. Pastikan ada akses alternatif jika tunnel ni satu-satunya connectivity.</div>
+      <div class="dim" style="font-size:.83em; margin-bottom:11px;">Tunnel akan drop sekejap &lt; 10s. Pastikan ada akses alternatif jika tunnel ni satu-satunya connectivity.</div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <input type="text" id="restartConfirmInput" placeholder="Taip \'restart\' untuk confirm" style="width:270px;">
         <button class="btn danger" onclick="doRestartWG()">Confirm Restart</button>
@@ -5245,56 +5495,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </div>
     </div>
   </div>
-
-  <div class="section vendor-block collapsed" id="block-bgpsummary">
-    <div class="vendor-block-head" data-vid="bgpsummary" onclick="toggleSec(\'bgpSummary\',event)">
-      <span class="chevron">&#9654;</span>
-      <span class="vtitle">BGP Summary</span>
-    </div>
-    <div class="vendor-block-body"><div class="route-list" id="bgpList"></div></div>
-  </div>
-
-  <div class="section vendor-block collapsed" id="block-bgpctl">
-    <div class="vendor-block-head" data-vid="bgpctl" onclick="toggleSec(\'bgpCtl\',event)">
-      <span class="chevron">&#9654;</span>
-      <span class="vtitle">BGP Control (announce / reset)</span>
-      <span class="badge stale" id="bgpOriginBadge">…</span>
-    </div>
-    <div class="vendor-block-body">
-    <div class="dim" style="font-size:.83em; margin-bottom:12px;">Locally originated prefix: <span class="mono bright">192.168.10.0/24</span> → neighbour 10.99.0.2 (AS65002).</div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-      <button class="btn success" id="bgpAnnounceBtn" onclick="bgpAnnounce()">Announce</button>
-      <button class="btn warn" onclick="document.getElementById(\'bgpResetConfirm\').style.display=\'block\'">&#8635; Soft reset BGP</button>
-      <button class="btn" onclick="loadBgpCtl()">&#8635; Reload</button>
-      <span id="bgpCtlMsg" class="msg-line"></span>
-    </div>
-    <div id="bgpResetConfirm" style="display:none; margin-top:12px; background:rgba(210,153,34,.06); border:1px solid rgba(210,153,34,.35); border-radius:12px; padding:16px;">
-      <div style="color:#B45309; font-weight:700; margin-bottom:7px;">&#9888; Send BGP soft reset to 10.99.0.2?</div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <input type="text" id="bgpResetInput" placeholder="Taip \'reset\' untuk confirm" style="width:270px;">
-        <button class="btn danger" onclick="doBgpReset()">Confirm Reset</button>
-        <button class="btn" onclick="document.getElementById(\'bgpResetConfirm\').style.display=\'none\'">Cancel</button>
-      </div>
-    </div>
-    </div>
-  </div>
-
-  <div class="section vendor-block collapsed" id="block-bgpcorr" style="display:none;">
-    <div class="vendor-block-head" data-vid="bgpcorr" onclick="toggleSec(\'bgpCorr\',event)">
-      <span class="chevron">&#9654;</span>
-      <span class="vtitle">BGP ↔ WG Correlation</span>
-      <span class="dim mono" id="bgpCorrHead" style="font-size:.76em;"></span>
-    </div>
-    <div class="vendor-block-body"><div class="table-scroll"><table>
-      <thead><tr><th>Prefix</th><th>Nexthop</th><th>WG peer</th><th>Kernel</th><th>Status</th></tr></thead>
-      <tbody id="bgpCorrTable"></tbody>
-    </table></div></div>
-  </div>
 </div>
 
 <div id="sambaTab" style="display:none;">
   <div class="samba-kpi" id="sambaKpi" style="display:none;">
-    <div class="kpi-mini"><div class="k">Storage</div><div class="v" id="kpiStorage">—</div><div class="s" id="kpiStorageSub">/DATA/labshare</div><div class="usage-track"><span class="usage-fill" id="kpiStorageFill" style="width:0%"></span></div></div>
+    <div class="kpi-mini"><div class="k">Storage</div><div class="v" id="kpiStorage">—</div><div class="s" id="kpiStorageSub">/DATA/sharelab</div><div class="usage-track"><span class="usage-fill" id="kpiStorageFill" style="width:0%"></span></div></div>
     <div class="kpi-mini"><div class="k">Sessions</div><div class="v" id="kpiSessions">—</div><div class="s" id="kpiSessionsSub">active connections</div></div>
   </div>
   <div class="section vendor-block collapsed" id="block-samba">
@@ -5333,11 +5538,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <div class="grid-2" style="gap:12px;">
         <div>
           <label class="flabel">Share name (auto-lowercased)</label>
-          <input type="text" id="sfName" placeholder="lab" autocapitalize="none" autocomplete="off" spellcheck="false">
+          <input type="text" id="sfName" placeholder="sharelab" autocapitalize="none" autocomplete="off" spellcheck="false">
         </div>
         <div>
           <label class="flabel">Folder path (server side)</label>
-          <input type="text" id="sfPath" placeholder="/DATA/labshare" autocapitalize="none" autocomplete="off" spellcheck="false">
+          <input type="text" id="sfPath" placeholder="/DATA/sharelab" autocapitalize="none" autocomplete="off" spellcheck="false">
         </div>
         <div>
           <label class="flabel">Valid users (space separated)</label>
@@ -5347,10 +5552,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
           <label class="flabel">Comment</label>
           <input type="text" id="sfComment" placeholder="DARKVEDA LAB share">
         </div>
-        <div>
-          <label class="flabel">Hosts allow (CIDRs, space separated)</label>
-          <input type="text" id="sfHosts" placeholder="192.168.10.0/24 172.16.30.0/24 172.16.3.0/24 172.16.20.0/24">
-        </div>
+        <div class="dim" style="font-size:.76em; margin-top:4px;">Open access: share is reachable from any IP (auth via valid users).</div>
         <div>
           <label class="flabel">Writable</label>
           <select id="sfWritable">
@@ -5416,7 +5618,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <div class="samba-card">
         <h3>Current Shares</h3>
         <div class="table-scroll"><table>
-          <thead><tr><th>Share</th><th>Users</th><th>Allowed</th><th style="text-align:right;">Actions</th></tr></thead>
+          <thead><tr><th>Share</th><th>Users</th><th style="text-align:right;">Actions</th></tr></thead>
           <tbody id="smbSharesTable"></tbody>
         </table></div>
       </div>
@@ -5666,7 +5868,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
           </div>
         </div>
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:9px;">
-          <div><label class="dim">Username</label><input type="text" id="mvEmUser" placeholder="you@gmail.com" style="width:100%;"></div>
+          <div><label class="dim">Username</label><input type="text" id="mvEmUser" placeholder="you@example.com" style="width:100%;"></div>
           <div><label class="dim">Password <span class="dim" style="text-transform:none; letter-spacing:0;">(saved — leave blank to keep)</span></label><input type="password" id="mvEmPass" placeholder="••••••" style="width:100%;"></div>
         </div>
         <div><label class="dim">From address</label><input type="text" id="mvEmFrom" placeholder="alerts@example.com" style="width:100%;"></div>
@@ -5904,7 +6106,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
       <span class="vtitle">Configuration Backups</span>
     </div>
     <div class="vendor-block-body">
-    <div class="dim" style="font-size:.83em; margin-bottom:12px;">Snapshots: interfaces, wg0.conf, frr.conf, iptables v4/v6, smb.conf, ns10.service. Restore re-applies services (network interfaces file needs reboot).</div>
+    <div class="dim" style="font-size:.83em; margin-bottom:12px;">Snapshots: interfaces, wg0.conf, iptables v4/v6, smb.conf. Restore re-applies services (network interfaces file needs reboot).</div>
     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
       <button class="btn success" onclick="createBackup()">&#128190; Create snapshot now</button>
       <button class="btn" onclick="loadBackups()">&#8635; Reload</button>
@@ -5916,7 +6118,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     </table></div>
     <div id="restoreConfirm" style="display:none; margin-top:12px; background:rgba(220,38,38,.06); border:1px solid rgba(220,38,38,.35); border-radius:12px; padding:16px;">
       <div style="color:#DC2626; font-weight:700; margin-bottom:7px;">&#9888; Restore <span id="restoreName" class="mono"></span>?</div>
-      <div class="dim" style="font-size:.83em; margin-bottom:11px;">Overwrites live configs &amp; restarts wg/frr/smbd/ns10. A pre-restore snapshot is taken first.</div>
+      <div class="dim" style="font-size:.83em; margin-bottom:11px;">Overwrites live configs &amp; restarts wg/smbd. A pre-restore snapshot is taken first.</div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <input type="text" id="restoreConfirmInput" placeholder="Taip \'restore\' untuk confirm" style="width:270px;">
         <button class="btn danger" onclick="doRestore()">Confirm Restore</button>
@@ -5998,7 +6200,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div style="display:flex; gap:7px; flex-wrap:wrap; margin-bottom:14px;">
       <button class="btn" onclick="loadServices()">&#8635; Reload</button>
     </div>
-    <div class="dim" style="font-size:.80em; margin-bottom:14px;">Restart stuck services from here. <b>networking</b> is status-only — restarting it would drop this session. Only Darkveda Lab services are listed.</div>
+    <div class="dim" style="font-size:.80em; margin-bottom:14px;">Start, stop or restart services from here. <b>networking</b> is status-only — touching it would drop this session. Only Darkveda Lab services are listed.</div>
     <div class="sub-label">Systemd units</div>
     <table>
       <thead><tr><th>Service</th><th>State</th><th style="text-align:right;">Actions</th></tr></thead>
@@ -6059,7 +6261,7 @@ function gsFetch(){
       GS_DATA=d.results||[]; GS_IDX=-1;
       if(!GS_DATA.length){ dd.innerHTML='<div class="gs-kind">No matches</div>'; dd.style.display='block'; return; }
       const groups={}; for(const r of GS_DATA){ (groups[r.kind]=groups[r.kind]||[]).push(r); }
-      const names={wg_peer:'WireGuard peers',wg_iface:'Interfaces',bgp:'BGP',route:'Routes',samba_share:'Samba shares',mvnbc_file:'Backup files',log:'Run logs'};
+      const names={wg_peer:'WireGuard peers',wg_iface:'Interfaces',route:'Routes',samba_share:'Samba shares',mvnbc_file:'Backup files',log:'Run logs'};
       let h='';
       for(const k of Object.keys(groups)){ h+='<div class="gs-kind">'+(names[k]||k)+'</div>'; groups[k].forEach((r,i)=>{ h+='<div class="gs-item" data-gi="'+GS_DATA.indexOf(r)+'"><div class="gs-label">'+esc(r.label)+'</div><div class="gs-sub">'+esc(r.sub||'')+'</div></div>'; }); }
       dd.innerHTML=h; dd.style.display='block';
@@ -6122,7 +6324,7 @@ function updateGlider() {
 }
 /* ---------- Setting: card visibility (hide/unhide) ---------- */
 const PORTAL_TABS_META = [
-  {id: \'wg\', name: \'WireGuard\', icon: \'\\u26A1\', desc: \'Tunnel status, peers, routes & wg0.conf\'},
+  {id: \'wg\', name: \'WireGuard\', icon: \'\\u26A1\', desc: \'Tunnel status, peers & wg0.conf\'},
   {id: \'mvnbc\', name: \'MVNBC\', icon: \'\\uD83D\\uDCBE\', desc: \'Multi-vendor config backups, devices & schedules\'},
   {id: \'smb\', name: \'Samba\', icon: \'\\uD83D\\uDCC1\', desc: \'File shares, users & active sessions\'},
   {id: \'ipam\', name: \'IPAM\', icon: \'\\uD83C\\uDF10\', desc: \'Subnets, IPs, VLANs & devices\'},
@@ -6355,7 +6557,7 @@ function refreshCurrent() {
   else if (CURRENT_VIEW === \'setting\') { portalTabsRender(); loadServices(); toast(\'Settings reloaded\', \'ok\'); }
   else if (CURRENT_VIEW === \'backup\') { loadBackups(); toast(\'Backups reloaded\', \'ok\'); }
   else if (CURRENT_VIEW === \'logviewer\') { if (logSourcesLoaded) loadLogs(); toast(\'Logs reloaded\', \'ok\'); }
-  else { loadData(); loadWgPeers(); loadBgpCtl(); loadBackups(); }
+  else { loadData(); loadWgPeers(); loadBackups(); }
 }
 
 let SPARK = [], __lastKey;
@@ -6473,13 +6675,18 @@ function render(data) {
       const ips = (iface.ip_info || {}).ips || [];
       const st = iface.effective_state || \'UNKNOWN\';
       const stCls = st === \'UP\' ? \'connected\' : (st === \'DOWN\' ? \'disconnected\' : \'stale\');
+      const down = st === \'DOWN\';
+      const ifaceAct = down
+        ? \'<button class="btn xs success" onclick="toggleWgIface(\\\'\' + esc(iface.name) + \'\\\',\\\'enable\\\')">Enable</button>\'
+        : \'<button class="btn xs warn" onclick="toggleWgIface(\\\'\' + esc(iface.name) + \'\\\',\\\'disable\\\')">Disable</button>\';
       ifaceTb.innerHTML += \'<tr>\' +
-        \'<td class="bright mono">\' + iface.name + \'</td>\' +
+        \'<td class="bright mono">\' + esc(iface.name) + \'</td>\' +
         \'<td><span class="badge \' + stCls + \'" title="kernel operstate: \' + (iface.kernel_state || \'n/a\') + \'">\' + st +
         \'<span style="opacity:.6; font-weight:400; font-size:.85em;"> (\' + (iface.kernel_state || \'?\').toLowerCase() + \')</span></span></td>\' +
-        \'<td class="mono">\' + iface.listen_port + \'</td>\' +
-        \'<td class="mono dim">\' + (ips.join(\', \') || \'none\') + \'</td>\' +
-        \'<td class="mono">\' + (iface.peers || []).length + \'</td></tr>\';
+        \'<td class="mono">\' + esc(iface.listen_port || \'—\') + \'</td>\' +
+        \'<td class="mono dim">\' + esc((ips.join(\', \') || \'none\')) + \'</td>\' +
+        \'<td class="mono">\' + (iface.peers || []).length + \'</td>\' +
+        \'<td style="text-align:right; white-space:nowrap;">\' + ifaceAct + \'</td></tr>\';
     }
 
     const peerTb = document.getElementById(\'peerTable\');
@@ -6488,63 +6695,30 @@ function render(data) {
       const cls = p.connected ? \'connected\' : (p.handshake_ago && p.handshake_ago < 300 ? \'stale\' : \'disconnected\');
       peerTb.innerHTML += \'<tr>\' +
         \'<td><span class="badge \' + cls + \'">\' + (p.connected ? \'ACTIVE\' : \'STALE\') + \'</span></td>\' +
-        \'<td class="mono dim" title="\' + esc(p.public_key||\'\') + \'">\' + (p.endpoint || \'N/A\') + \'</td>\' +
-        \'<td class="mono">\' + p.allowed_ips + \'</td>\' +
-        \'<td class="mono" style="color:\' + (p.connected ? \'#15803d\' : \'#B45309\') + \'">\' + p.handshake_human + \'</td>\' +
-        \'<td class="mono">\' + p.rx_human + \'</td>\' +
-        \'<td class="mono">\' + p.tx_human + \'</td><td><canvas class="peer-spark" data-pub="\' + esc(p.public_key||\'\') + \'" width="120" height="28" title="RX/TX 24h"></canvas></td></tr>\';
+        \'<td class="mono dim" title="\' + esc(p.public_key||\'\') + \'">\' + esc(p.endpoint || \'N/A\') + \'</td>\' +
+        \'<td class="mono">\' + esc(p.allowed_ips) + \'</td>\' +
+        \'<td class="mono" style="color:\' + (p.connected ? \'#15803d\' : \'#B45309\') + \'">\' + esc(p.handshake_human) + \'</td>\' +
+        \'<td class="mono">\' + esc(p.rx_human) + \'</td>\' +
+        \'<td class="mono">\' + esc(p.tx_human) + \'</td><td><canvas class="peer-spark" data-pub="\' + esc(p.public_key||\'\') + \'" width="120" height="28" title="RX/TX 24h"></canvas></td>\' +
+        \'<td style="text-align:right; white-space:nowrap;"><button class="btn xs warn" onclick="toggleWgPeer(\\\'\' + (p.public_key||\'\') + \'\\\',\\\'disable\\\')">Disable</button></td></tr>\';
     }
+    const disPeers = ((wgIface && wgIface.disabled_peers) || []);
+    for (const p of disPeers) {
+      const ips = Array.isArray(p.allowed_ips) ? p.allowed_ips.join(\', \') : (p.allowed_ips || \'\');
+      peerTb.innerHTML += \'<tr style="opacity:.75;">\' +
+        \'<td><span class="badge disconnected">DISABLED</span></td>\' +
+        \'<td class="mono dim" title="\' + esc(p.public_key||\'\') + \'">\' + esc(p.endpoint || \'N/A\') + \'</td>\' +
+        \'<td class="mono">\' + esc(ips) + \'</td>\' +
+        \'<td class="mono dim">—</td>\' +
+        \'<td class="mono dim">—</td>\' +
+        \'<td class="mono dim">—</td><td class="dim" style="font-size:.75em;">disabled</td>\' +
+        \'<td style="text-align:right; white-space:nowrap;"><button class="btn xs success" onclick="toggleWgPeer(\\\'\' + (p.public_key||\'\') + \'\\\',\\\'enable\\\')">Enable</button></td></tr>\';
+    }
+    if (!peers.length && !disPeers.length) peerTb.innerHTML = \'<tr><td colspan="8" class="dim">no peers</td></tr>\';
     for (const p of peers) {
       const cv = document.querySelector(\'canvas.peer-spark[data-pub="\' + CSS.escape(p.public_key||\'\') + \'"]\');
       if (cv) drawPeerSpark(cv, p.public_key);
     }
-  }
-
-  const rl = document.getElementById(\'routeList\');
-  rl.innerHTML = (data.routes || []).map(r => \'<div>\' + r + \'</div>\').join(\'\') || \'<div class="dim">no WG routes</div>\';
-
-  const bl = document.getElementById(\'bgpList\');
-  const bgpPeers = data.bgp.peers || [];
-  if (bgpPeers.length > 0) {
-    bl.innerHTML = bgpPeers.map(p =>
-      \'<div>\' + p.neighbor + \' <span class="dim">AS\' + p.remote_as + \'</span> <span class="badge \' +
-      (p.state === \'Established\' ? \'connected\' : \'disconnected\') + \'" style="margin-left:8px">\' +
-      (p.state === \'Established\' ? p.pfx_rcd + \' pfx\' : p.state) + \'</span> <span class="dim" style="margin-left:8px">\' + p.up_time + \'</span></div>\'
-    ).join(\'\');
-    const up = bgpPeers.filter(p => p.state === \'Established\').length;
-    const bs = document.getElementById(\'bgpStatus\');
-    bs.textContent = up + \'/\' + bgpPeers.length;
-    bs.className = \'value \' + (up > 0 ? \'up\' : \'down\');
-    document.getElementById(\'bgpDetail\').textContent = up > 0 ? \'established\' : \'down\';
-  } else {
-    bl.innerHTML = \'<div class="dim">no BGP peers or FRR not running</div>\';
-    const bs = document.getElementById(\'bgpStatus\');
-    bs.textContent = \'N/A\';
-    bs.className = \'value warn\';
-    document.getElementById(\'bgpDetail\').textContent = \'FRR not found\';
-  }
-  renderBgpCorr(data.bgp_corr);
-}
-
-function renderBgpCorr(c) {
-  const sec = document.getElementById(\'block-bgpcorr\');
-  if (!sec || !c) { if (sec) sec.style.display = \'none\'; return; }
-  const rows = c.rows || [];
-  if (!rows.length) { sec.style.display = \'none\'; return; }
-  sec.style.display = \'\';
-  const head = \'AS\' + (c.local_as || \'?\') + \' (RID \' + (c.router_id || \'?\') + \') \u2194 AS\' + (c.remote_as || \'?\') +
-    \' \u00b7 \' + (c.received_count||0) + \' received / \' + (c.advertised_count||0) + \' advertised\';
-  document.getElementById(\'bgpCorrHead\').textContent = head;
-  const tb = document.getElementById(\'bgpCorrTable\');
-  tb.innerHTML = \'\';
-  const clsFor = (s) => s === \'OK\' ? \'connected\' : (s === \'ADVERTISED\' ? \'stale\' : \'disconnected\');
-  for (const r of rows) {
-    tb.innerHTML += \'<tr>\' +
-      \'<td class="mono bright">\' + esc(r.prefix) + (r.dir === \'wg-only\' ? \' <span class="dim">(wg-only)</span>\' : \'\') + \'</td>\' +
-      \'<td class="mono dim">\' + esc(r.nexthop || \'-\') + \'</td>\' +
-      \'<td class="mono dim">\' + esc((r.wg_peers || []).join(\', \') || \'-\') + \'</td>\' +
-      \'<td class="mono dim">\' + (r.in_kernel ? \'yes\' : \'no\') + \'</td>\' +
-      \'<td><span class="badge \' + clsFor(r.status) + \'">\' + esc(r.status) + \'</span></td></tr>\';
   }
 }
 
@@ -6564,7 +6738,7 @@ function toggleSec(id, event) {
   if (id === \'logviewer\' && el && !el.classList.contains(\'collapsed\')) { try { if (!logSourcesLoaded) loadLogSources(); } catch (e) {} }
 }
 function applySecState() {
-  for (const id of [\'wgRoutes\', \'bgpSummary\', \'bgpCorr\', \'wgConf\', \'connPeers\', \'smbConf\', \'wgPeers\', \'bgpCtl\', \'netBackup\', \'logviewer\']) {
+  for (const id of [\'wgConf\', \'connPeers\', \'smbConf\', \'wgPeers\', \'netBackup\', \'logviewer\']) {
     const el = document.getElementById(\'block-\' + id.toLowerCase());
     if (el) el.classList.add(\'collapsed\');
   }
@@ -6671,7 +6845,8 @@ async function loadWgPeers() {
         const files = p.has_client
           ? \'<a class="btn xs" href="/api/wg/peers/qr?pub=\' + encodeURIComponent(p.public_key) + \'" target="_blank">QR</a> \' +
             \'<a class="btn xs" href="/api/wg/peers/conf?pub=\' + encodeURIComponent(p.public_key) + \'">Conf</a> \' : \'\';
-        acts = files + \'<button class="btn xs danger" onclick="delWgPeer(\\\'\' + p.public_key + \'\\\')">Del</button>\';
+        acts = files + \'<button class="btn xs warn" onclick="toggleWgPeer(\\\'\' + p.public_key + \'\\\',\\\'disable\\\')">Disable</button> \' +
+          \'<button class="btn xs danger" onclick="delWgPeer(\\\'\' + p.public_key + \'\\\')">Del</button>\';
       }
       tb.innerHTML += \'<tr><td class="bright mono">\' + esc(p.name || p.public_short) + \'</td>\' +
         \'<td class="mono dim">\' + esc((p.allowed_ips || []).join(\', \')) + \'</td>\' +
@@ -6679,8 +6854,48 @@ async function loadWgPeers() {
         \'<td class="mono dim">\' + esc((p.rx || \'-\') + \' / \' + (p.tx || \'-\')) + \'</td>\' +
         \'<td style="text-align:right; white-space:nowrap;">\' + acts + \'</td></tr>\';
     }
-    if (!(d.peers || []).length) tb.innerHTML = \'<tr><td colspan="5" class="dim">no peers</td></tr>\';
+    for (const p of (d.disabled || [])) {
+      const files = p.has_client
+        ? \'<a class="btn xs" href="/api/wg/peers/qr?pub=\' + encodeURIComponent(p.public_key) + \'" target="_blank">QR</a> \' +
+          \'<a class="btn xs" href="/api/wg/peers/conf?pub=\' + encodeURIComponent(p.public_key) + \'">Conf</a> \' : \'\';
+      const acts = files + \'<button class="btn xs success" onclick="toggleWgPeer(\\\'\' + p.public_key + \'\\\',\\\'enable\\\')">Enable</button> \' +
+        \'<button class="btn xs danger" onclick="delWgPeer(\\\'\' + p.public_key + \'\\\')">Del</button>\';
+      tb.innerHTML += \'<tr style="opacity:.75;"><td class="bright mono">\' + esc(p.name || p.public_short) + \'</td>\' +
+        \'<td class="mono dim">\' + esc((p.allowed_ips || []).join(\', \')) + \'</td>\' +
+        \'<td><span class="badge disconnected">DISABLED</span></td>\' +
+        \'<td class="mono dim">—</td>\' +
+        \'<td style="text-align:right; white-space:nowrap;">\' + acts + \'</td></tr>\';
+    }
+    if (!(d.peers || []).length && !(d.disabled || []).length) tb.innerHTML = \'<tr><td colspan="5" class="dim">no peers</td></tr>\';
   } catch(e) { wgPeerMsg(\'Load failed: \' + e, \'#DC2626\'); }
+}
+/* ---------- WireGuard interface + peer enable/disable ---------- */
+async function toggleWgIface(iface, action) {
+  const dis = action !== \'enable\';
+  if (dis && !confirm(\'Disable interface \' + iface + \'? ALL its peers drop immediately.\')) return;
+  try {
+    const res = await fetch(\'/api/wg/iface\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\', \'X-CSRF-Token\': CSRF},
+      body: JSON.stringify({iface: iface, action: action})
+    });
+    const d = await res.json();
+    if (d.ok) { toast(d.message, \'ok\'); loadData(); }
+    else toast(d.error || \'Interface toggle failed\', \'err\');
+  } catch(e) { toast(\'Interface toggle failed: \' + e, \'err\'); }
+}
+async function toggleWgPeer(pub, action) {
+  if (action === \'disable\' && !confirm(\'Disable peer \' + pub.slice(0, 12) + \'…? Its tunnel drops immediately (config kept, can re-enable).\')) return;
+  try {
+    const res = await fetch(\'/api/wg/peer-toggle\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\', \'X-CSRF-Token\': CSRF},
+      body: JSON.stringify({public_key: pub, action: action})
+    });
+    const d = await res.json();
+    if (d.ok) { toast(d.message, \'ok\'); loadData(); loadWgPeers(); }
+    else toast(d.error || \'Peer toggle failed\', \'err\');
+  } catch(e) { toast(\'Peer toggle failed: \' + e, \'err\'); }
 }
 async function saveWgPeer() {
   const body = {
@@ -6728,64 +6943,6 @@ async function delWgPeer(pub) {
     if (d.ok) { toast(\'Peer removed\', \'ok\'); loadWgPeers(); setTimeout(loadData, 3000); }
     else { toast(\'Delete failed: \' + (d.error || \'\'), \'err\'); }
   } catch(e) { toast(\'Delete failed: \' + e, \'err\'); }
-}
-
-/* ---------- BGP control ---------- */
-function bgpCtlMsg(text, color) {
-  const el = document.getElementById(\'bgpCtlMsg\');
-  if (el) { el.textContent = text || \'\'; el.style.color = color || \'#6B5CA5\'; }
-}
-let bgpAnnounced = null;
-async function loadBgpCtl() {
-  try {
-    const res = await fetch(\'/api/bgp/origin\');
-    if (res.status === 401) { window.location = \'/login\'; return; }
-    const d = await res.json();
-    const badge = document.getElementById(\'bgpOriginBadge\');
-    const btn = document.getElementById(\'bgpAnnounceBtn\');
-    if (d.ok) {
-      bgpAnnounced = !!d.announced;
-      badge.textContent = bgpAnnounced ? \'ANNOUNCED\' : \'WITHDRAWN\';
-      badge.className = \'badge \' + (bgpAnnounced ? \'connected\' : \'disconnected\');
-      btn.textContent = bgpAnnounced ? \'Withdraw\' : \'Announce\';
-      btn.className = \'btn \' + (bgpAnnounced ? \'danger\' : \'success\');
-    } else {
-      badge.textContent = \'UNKNOWN\'; badge.className = \'badge stale\';
-    }
-  } catch(e) { bgpCtlMsg(\'Load failed: \' + e, \'#DC2626\'); }
-}
-async function bgpAnnounce() {
-  const action = bgpAnnounced ? \'withdraw\' : \'announce\';
-  if (!confirm(action === \'announce\' ? \'Announce 192.168.10.0/24 to AS65002?\' : \'Withdraw 192.168.10.0/24 (home loses this route)?\')) return;
-  bgpCtlMsg(action + \'ing...\', \'#B45309\');
-  try {
-    const res = await fetch(\'/api/bgp/announce\', {
-      method: \'POST\',
-      headers: {\'Content-Type\': \'application/json\', \'X-CSRF-Token\': CSRF},
-      body: JSON.stringify({action: action})
-    });
-    const d = await res.json();
-    if (d.ok) { bgpCtlMsg(\'✓ \' + d.message, \'#15803d\'); toast(\'BGP updated\', \'ok\'); loadBgpCtl(); setTimeout(loadData, 4000); }
-    else { bgpCtlMsg(\'✗ \' + (d.error || \'failed\'), \'#DC2626\'); toast(d.error || \'Failed\', \'err\'); }
-  } catch(e) { bgpCtlMsg(\'Failed: \' + e, \'#DC2626\'); }
-}
-async function doBgpReset() {
-  const input = document.getElementById(\'bgpResetInput\');
-  const val = input.value.trim().toLowerCase();
-  if (val !== \'reset\') { input.style.borderColor = \'#DC2626\'; input.focus(); toast(\'Type "reset" to confirm\', \'warn\'); return; }
-  input.style.borderColor = \'\';
-  try {
-    const res = await fetch(\'/api/bgp/reset\', {
-      method: \'POST\',
-      headers: {\'Content-Type\': \'application/json\', \'X-CSRF-Token\': CSRF},
-      body: JSON.stringify({confirm: val})
-    });
-    const d = await res.json();
-    document.getElementById(\'bgpResetConfirm\').style.display = \'none\';
-    input.value = \'\';
-    if (d.ok) { bgpCtlMsg(\'✓ \' + d.message, \'#15803d\'); toast(\'BGP reset sent\', \'ok\'); setTimeout(loadData, 4000); }
-    else { bgpCtlMsg(\'✗ \' + (d.error || \'failed\'), \'#DC2626\'); }
-  } catch(e) { bgpCtlMsg(\'Failed: \' + e, \'#DC2626\'); }
 }
 
 /* ---------- Config backups ---------- */
@@ -6874,7 +7031,7 @@ function logMsg(text, color) {
 }
 async function loadLogSources() {
   try {
-    const res = await fetch(\'/api/services\');
+    const res = await fetch(\'/api/logs/sources\');
     if (res.status === 401) { window.location = \'/login\'; return; }
     const d = await res.json();
     const sel = document.getElementById(\'logSource\');
@@ -6884,8 +7041,8 @@ async function loadLogSources() {
       o.value = kind + \'|\' + value; o.textContent = label;
       sel.appendChild(o);
     };
-    for (const u of (d.units || [])) add(\'systemd\', u.unit, \'⚙ \' + u.label);
-    for (const c of (d.containers || [])) add(\'docker\', c.unit, \'🐳 \' + c.unit);
+    for (const s of (d.sources || [])) add(s.kind, s.value, s.label);
+    if (!(d.sources || []).length) { logMsg(\'No log sources available\', \'#B45309\'); return; }
     logSourcesLoaded = true;
     loadLogs();
   } catch(e) { logMsg(\'Sources failed: \' + e, \'#DC2626\'); }
@@ -6936,19 +7093,30 @@ async function loadServices() {
         const rstBtn = u.restartable
           ? \'<button class="btn xs warn" onclick="restartService(\\\'systemd\\\',\\\'\' + esc(u.unit) + \'\\\')">Restart</button> \'
           : \'\';
+        const ssBtn = u.startable
+          ? (on
+            ? \'<button class="btn xs danger" onclick="setServiceState(\\\'systemd\\\',\\\'\' + esc(u.unit) + \'\\\',\\\'stop\\\')">Stop</button> \'
+            : \'<button class="btn xs success" onclick="setServiceState(\\\'systemd\\\',\\\'\' + esc(u.unit) + \'\\\',\\\'start\\\')">Start</button> \')
+          : \'\';
         utb.innerHTML += \'<tr><td class="bright mono">\' + esc(u.label) +
           \'<div class="dim" style="font-size:.78em;">\' + esc(u.unit) + (u.enabled ? \' · \' + esc(u.enabled) : \'\') + \'</div></td>\' +
           \'<td><span class="badge \' + (on ? \'connected\' : \'disconnected\') + \'">\' + esc(String(u.active).toUpperCase()) + \'</span></td>\' +
-          \'<td style="text-align:right; white-space:nowrap;">\' + rstBtn + enBtn + \'</td></tr>\';
+          \'<td style="text-align:right; white-space:nowrap;">\' + ssBtn + rstBtn + enBtn + \'</td></tr>\';
       }
     }
     const dtb = document.getElementById(\'svcDockerTable\');
     if (dtb) {
       dtb.innerHTML = \'\';
       for (const c of (d.containers || [])) {
+        const running = (typeof c.running === \'boolean\') ? c.running : String(c.active || \'\').indexOf(\'Up\') === 0;
+        const canSS = c.startable !== false;
+        const ssBtn = !canSS ? \'\' : (running
+          ? \'<button class="btn xs danger" onclick="setServiceState(\\\'docker\\\',\\\'\' + esc(c.unit) + \'\\\',\\\'stop\\\')">Stop</button> \'
+          : \'<button class="btn xs success" onclick="setServiceState(\\\'docker\\\',\\\'\' + esc(c.unit) + \'\\\',\\\'start\\\')">Start</button> \');
         dtb.innerHTML += \'<tr><td class="bright mono">\' + esc(c.unit) + \'</td>\' +
           \'<td class="mono dim" style="font-size:.8em;">\' + esc(c.active) + \'</td>\' +
-          \'<td style="text-align:right;"><button class="btn xs warn" onclick="restartService(\\\'docker\\\',\\\'\' + esc(c.unit) + \'\\\')">Restart</button></td></tr>\';
+          \'<td style="text-align:right; white-space:nowrap;">\' + ssBtn +
+          \'<button class="btn xs warn" onclick="restartService(\\\'docker\\\',\\\'\' + esc(c.unit) + \'\\\')">Restart</button></td></tr>\';
       }
       if (!(d.containers || []).length) dtb.innerHTML = \'<tr><td colspan="3" class="dim">no containers (docker down?)</td></tr>\';
     }
@@ -6969,6 +7137,21 @@ async function restartService(kind, unit) {
     if (d.ok) { toast(d.message, \'ok\'); setTimeout(loadServices, kind === \'docker\' ? 8000 : 4000); }
     else toast(d.error || \'Restart failed\', \'err\');
   } catch(e) { toast(\'Restart failed: \' + e, \'err\'); }
+}
+async function setServiceState(kind, unit, action) {
+  const verb = action === \'stop\' ? \'Stop \' : \'Start \';
+  const tail = action === \'stop\' ? \'? It will stay stopped until started again.\' : \'?\';
+  if (!confirm(verb + unit + tail)) return;
+  try {
+    const res = await fetch(\'/api/services/state\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\', \'X-CSRF-Token\': CSRF},
+      body: JSON.stringify({kind: kind, unit: unit, action: action, confirm: action})
+    });
+    const d = await res.json();
+    if (d.ok) { toast(d.message, \'ok\'); setTimeout(loadServices, kind === \'docker\' ? 5000 : 3000); }
+    else toast(d.error || \'Failed\', \'err\');
+  } catch(e) { toast(\'Failed: \' + e, \'err\'); }
 }
 async function toggleServiceEnabled(unit, action) {
   const verb = action === \'disable\' ? \'Disable autostart for \' : \'Enable autostart for \';
@@ -7015,14 +7198,10 @@ async function loadSmb() {
       const mode = s.writable ? \'<span class="badge connected">RW</span>\' : \'<span class="badge stale">RO</span>\';
       const uu = (d.usage && d.usage[s.name]) || null;
       if (uu) { hasUsage=true; totFree+=uu.free||0; totTotal+=uu.total||0; }
-      const nets = String(s.hosts_allow||\'\').split(/[\s,]+/).filter(Boolean);
-      const shown = nets.slice(0,3).map(n=>\'<span class="net-chip">\'+esc(n)+\'</span>\').join(\'\');
-      const more = nets.length>3 ? (\' <button class="net-more" title="\'+esc(nets.slice(3).join(\', \'))+\'">+\'+(nets.length-3)+\' more</button>\') : \'\';
       const tip = uu ? (fmtBytes(uu.free) + ' free / ' + fmtBytes(uu.total) + ' (' + (uu.pct||0) + '%)') : 'no data';
       tb.innerHTML += \'<tr title="\' + esc(tip) + \'">\' +
         \'<td><div class="bright mono">\' + esc(s.name) + \'  \' + mode + \'</div><div class="share-row-path">\' + esc(s.path) + \'</div></td>\' +
         \'<td class="mono dim">\' + esc(s.valid_users || \'ALL\') + \'</td>\' +
-        \'<td style="max-width:180px;">\' + shown + more + \'</td>\' +
         \'<td style="text-align:right; white-space:nowrap;" class="samba-actions">\' +
           \'<button class="btn xs" title="Browse files" onclick="sbOpen(\\\'\' + esc(s.name) + \'\\\')">Files</button> \' +
           \'<button class="btn xs" title="Edit share" onclick="shareEdit(\\\'\' + esc(s.name) + \'\\\')">Edit</button> \' +
@@ -7052,7 +7231,7 @@ async function loadSmb() {
       if (ub) ub.innerHTML = \'\';
       if (ubEmpty) ubEmpty.style.display = \'block\';
     }
-    if (!SMB_SHARES.length) tb.innerHTML = \'<tr><td colspan="5" class="dim">no shares</td></tr>\';
+    if (!SMB_SHARES.length) tb.innerHTML = \'<tr><td colspan="3" class="dim">no shares</td></tr>\';
 
     const utb = document.getElementById(\'smbUsersTable\');
     utb.innerHTML = \'\';
@@ -7109,12 +7288,11 @@ function toggleShareForm(mode, name) {
   if (show) {
     smbMsg(\'shareFormMsg\', \'\');
     document.getElementById(\'shareFormTitle\').textContent = mode === \'edit\' ? \'Edit Share: \' + name : \'Add Share\';
-    if (mode !== \'edit\') {
-      for (const id of [\'sfName\',\'sfPath\',\'sfComment\',\'sfUsers\']) document.getElementById(id).value = \'\';
-      document.getElementById(\'sfName\').disabled = false;
-      document.getElementById(\'sfHosts\').value = \'192.168.10.0/24 172.16.30.0/24 172.16.3.0/24 172.16.20.0/24\';
-      document.getElementById(\'sfWritable\').value = \'1\';
-      document.getElementById(\'sfMkdir\').checked = false;
+    if (mode !== 'edit') {
+      for (const id of ['sfName','sfPath','sfComment','sfUsers']) document.getElementById(id).value = '';
+      document.getElementById('sfName').disabled = false;
+      document.getElementById('sfWritable').value = '1';
+      document.getElementById('sfMkdir').checked = false;
     }
   }
 }
@@ -7130,7 +7308,6 @@ function shareEdit(name) {
   document.getElementById(\'sfPath\').value = s.path;
   document.getElementById(\'sfComment\').value = s.comment || \'\';
   document.getElementById(\'sfUsers\').value = s.valid_users || \'\';
-  document.getElementById(\'sfHosts\').value = s.hosts_allow === \'ALL\' ? \'ALL\' : s.hosts_allow;
   document.getElementById(\'sfWritable\').value = s.writable ? \'1\' : \'0\';
   smbMsg(\'shareFormMsg\', \'\');
 }
@@ -7142,7 +7319,6 @@ async function saveShare() {
     path: document.getElementById(\'sfPath\').value.trim(),
     comment: document.getElementById(\'sfComment\').value.trim(),
     valid_users: document.getElementById(\'sfUsers\').value.trim(),
-    hosts_allow: document.getElementById(\'sfHosts\').value.trim(),
     writable: document.getElementById(\'sfWritable\').value === \'1\',
     create_folder: document.getElementById(\'sfMkdir\').checked
   };
@@ -8241,7 +8417,6 @@ window.addEventListener(\'hashchange\', () => { if (window.location.hash === \'#
 loadData();
 loadWGConf();
 loadWgPeers();
-loadBgpCtl();
 loadBackups();
 applySecState();
 portalTabsLoad();
